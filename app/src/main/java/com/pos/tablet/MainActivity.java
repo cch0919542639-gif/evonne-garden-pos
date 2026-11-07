@@ -359,17 +359,23 @@ public class MainActivity extends Activity {
                                 pendingQrOrders.addAll(list);
                                 updateQrOrdersBadge();
                                 if (list.size() > prevSize) {
+                                    try {
+                                        android.media.ToneGenerator tg = new android.media.ToneGenerator(
+                                            android.media.AudioManager.STREAM_NOTIFICATION, 100);
+                                        tg.startTone(android.media.ToneGenerator.TONE_PROP_BEEP2, 400);
+                                    } catch (Exception ignored) {}
                                     Toast.makeText(MainActivity.this,
                                         "🔔 收到新的客人手機掃碼點餐訂單！(共 " + list.size() + " 筆待接單)",
                                         Toast.LENGTH_LONG).show();
+                                    showQrOrdersAndStandeeDialog();
                                 }
                             }
                         }
                     });
                 }
-                qrPollHandler.postDelayed(this, 25000);
+                qrPollHandler.postDelayed(this, 12000);
             }
-        }, 5000);
+        }, 4000);
     }
 
     private void updateQrOrdersBadge() {
@@ -451,6 +457,17 @@ public class MainActivity extends Activity {
                     @Override
                     public void onResult(boolean ok, String msg) {
                         Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show();
+                        new AlertDialog.Builder(MainActivity.this)
+                            .setTitle(ok ? "✅ 雲端菜單同步完成" : "⚠️ 雲端同步提示")
+                            .setMessage(msg + "\n\n💡 您可以直接點下方【📱 開啟各桌掃碼點餐 QR Code 條碼 & 印桌牌中心】查看或列印各桌條碼！")
+                            .setPositiveButton("📱 立即查看各桌 QR Code", new DialogInterface.OnClickListener() {
+                                @Override
+                                public void onClick(DialogInterface d, int w) {
+                                    showQrOrdersAndStandeeDialog();
+                                }
+                            })
+                            .setNegativeButton("稍後", null)
+                            .show();
                     }
                 });
             }
@@ -3815,7 +3832,7 @@ public class MainActivity extends Activity {
         lpSave.rightMargin = dp(6);
         cloudBtnRow.addView(btnSaveCfg, lpSave);
 
-        Button btnUploadMenu = new Button(this);
+        final Button btnUploadMenu = new Button(this);
         btnUploadMenu.setText("⬆️ 上傳菜單備份至試算表");
         btnUploadMenu.setAllCaps(false);
         btnUploadMenu.setTextSize(12);
@@ -3825,9 +3842,34 @@ public class MainActivity extends Activity {
             @Override public void onClick(View v) {
                 googleSheetUrl = etSheet.getText().toString().trim();
                 dbHelper.setSetting("google_sheet_url", googleSheetUrl);
+                if (googleSheetUrl.isEmpty()) {
+                    new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("⚠️ 尚未填寫試算表網址")
+                        .setMessage("請先在上方網址欄貼上 Google Apps Script Web App 網址 (/exec 結尾) 再按上傳！")
+                        .setPositiveButton("好", null)
+                        .show();
+                    return;
+                }
+                btnUploadMenu.setText("⏳ 正在上傳 " + menuItems.size() + " 道菜單...");
+                btnUploadMenu.setEnabled(false);
+                Toast.makeText(MainActivity.this, "⏳ 正在上傳菜單至 Google 試算表，請稍候 3~5 秒...", Toast.LENGTH_SHORT).show();
                 CloudSyncManager.uploadMenuAsync(googleSheetUrl, menuItems, new CloudSyncManager.SyncCallback() {
                     @Override public void onResult(boolean ok, String msg) {
+                        btnUploadMenu.setText("⬆️ 上傳菜單備份至試算表");
+                        btnUploadMenu.setEnabled(true);
                         Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show();
+                        new AlertDialog.Builder(MainActivity.this)
+                            .setTitle(ok ? "✅ 菜單上傳成功！" : "❌ 菜單上傳失敗")
+                            .setMessage(msg + (ok
+                                ? "\n\n🎉 雲端「菜單設定」分頁已建立完成！現在客人掃描各桌 QR Code 即可看到完整 " + menuItems.size() + " 道餐點與飲品！"
+                                : "\n\n請確認平板已連上店內 Wi-Fi 且網址正確。"))
+                            .setPositiveButton("📱 開啟各桌 QR Code 條碼", new DialogInterface.OnClickListener() {
+                                @Override public void onClick(DialogInterface d, int w) {
+                                    showQrOrdersAndStandeeDialog();
+                                }
+                            })
+                            .setNegativeButton("確定", null)
+                            .show();
                     }
                 });
             }
@@ -3836,7 +3878,7 @@ public class MainActivity extends Activity {
         lpUp.rightMargin = dp(6);
         cloudBtnRow.addView(btnUploadMenu, lpUp);
 
-        Button btnDownloadMenu = new Button(this);
+        final Button btnDownloadMenu = new Button(this);
         btnDownloadMenu.setText("⬇️ 從試算表下載更新菜單");
         btnDownloadMenu.setAllCaps(false);
         btnDownloadMenu.setTextSize(12);
@@ -3846,8 +3888,12 @@ public class MainActivity extends Activity {
             @Override public void onClick(View v) {
                 googleSheetUrl = etSheet.getText().toString().trim();
                 dbHelper.setSetting("google_sheet_url", googleSheetUrl);
+                btnDownloadMenu.setText("⏳ 正在從試算表下載...");
+                btnDownloadMenu.setEnabled(false);
                 CloudSyncManager.downloadMenuAsync(googleSheetUrl, new CloudSyncManager.MenuDownloadCallback() {
                     @Override public void onResult(boolean ok, String msg, List<MenuItem> downloaded) {
+                        btnDownloadMenu.setText("⬇️ 從試算表下載更新菜單");
+                        btnDownloadMenu.setEnabled(true);
                         if (ok && downloaded != null && !downloaded.isEmpty()) {
                             menuItems.clear();
                             menuItems.addAll(downloaded);
@@ -3856,12 +3902,34 @@ public class MainActivity extends Activity {
                             rebuildSettingsTab();
                         }
                         Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show();
+                        new AlertDialog.Builder(MainActivity.this)
+                            .setTitle(ok ? "✅ 下載更新菜單成功" : "⚠️ 下載菜單提示")
+                            .setMessage(msg)
+                            .setPositiveButton("確定", null)
+                            .show();
                     }
                 });
             }
         });
         cloudBtnRow.addView(btnDownloadMenu, new LinearLayout.LayoutParams(0, dp(38), 1f));
         box.addView(cloudBtnRow);
+
+        Button btnOpenQrCenterInSettings = new Button(this);
+        btnOpenQrCenterInSettings.setText("📱 點此開啟：【各桌掃碼點餐 QR Code 條碼 & 出單機印桌牌 / 線上待接單中心】");
+        btnOpenQrCenterInSettings.setAllCaps(false);
+        btnOpenQrCenterInSettings.setTextSize(13);
+        btnOpenQrCenterInSettings.setTypeface(null, Typeface.BOLD);
+        btnOpenQrCenterInSettings.setTextColor(Color.parseColor("#052E16"));
+        btnOpenQrCenterInSettings.setBackground(roundBg(Color.parseColor("#F59E0B"), Color.WHITE, 1, 8));
+        btnOpenQrCenterInSettings.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                showQrOrdersAndStandeeDialog();
+            }
+        });
+        LinearLayout.LayoutParams lpQrSet = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(42));
+        lpQrSet.topMargin = dp(8);
+        box.addView(btnOpenQrCenterInSettings, lpQrSet);
 
         // 4. 平板本地菜單新增 / 改價 / 還原管理
         LinearLayout menuHeaderRow = new LinearLayout(this);
