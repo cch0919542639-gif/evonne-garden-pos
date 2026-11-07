@@ -1,0 +1,16 @@
+# Build outputs & temporary files
+build/
+*.apk
+*.keystore
+*.jks
+*.idsig
+*.log
+pos_ui.xml
+screen.png
+doc.txt
+
+# Environment & local secrets
+.env
+.env.*
+local.properties
+*.secret
