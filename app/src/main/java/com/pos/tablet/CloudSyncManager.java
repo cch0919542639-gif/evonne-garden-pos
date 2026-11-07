@@ -33,6 +33,35 @@ public class CloudSyncManager {
         void onResult(boolean success, String message, List<MainActivity.MenuItem> downloadedMenu);
     }
 
+    public static class PendingQrItem {
+        public String name;
+        public int qty;
+        public int unitPrice;
+        public String choice;
+        public String sweet;
+        public String ice;
+        public String mealDrinkName;
+        public int mealDrinkDiff;
+        public String mealDrinkSweet;
+        public String mealDrinkIce;
+        public List<MainActivity.AddonOption> addons = new ArrayList<>();
+        public String note;
+    }
+
+    public static class PendingQrOrder {
+        public String orderId;
+        public String time;
+        public String table; // 如 "1桌".."13桌" 或 "外帶" / "外送"
+        public String paymentPref; // 如 "現金", "信用卡", "LINE Pay"
+        public String customerNote;
+        public int total;
+        public List<PendingQrItem> items = new ArrayList<>();
+    }
+
+    public interface QrOrdersCallback {
+        void onResult(boolean success, String message, List<PendingQrOrder> pendingOrders);
+    }
+
     private static final ExecutorService EXECUTOR = Executors.newSingleThreadExecutor();
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
     private static final int CONNECT_TIMEOUT_MS = 10000;
@@ -206,6 +235,110 @@ public class CloudSyncManager {
                             if (callback != null) callback.onResult(false, "❌ 下載菜單失敗：" + e.getMessage(), null);
                         }
                     });
+                }
+            }
+        });
+    }
+
+    // ==================== 4. 拉取雲端「📱 客人掃碼點餐」待接訂單佇列 ====================
+    public static void fetchPendingQrOrdersAsync(final String webAppUrl,
+                                                 final QrOrdersCallback callback) {
+        if (!isValidWebAppUrl(webAppUrl)) {
+            MAIN_HANDLER.post(new Runnable() {
+                @Override public void run() {
+                    if (callback != null) callback.onResult(false, "請先於設定頁儲存有效的 Google 試算表網址", null);
+                }
+            });
+            return;
+        }
+        EXECUTOR.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject req = new JSONObject();
+                    req.put("action", "fetch_pending_qr_orders");
+                    String resp = postJsonFollowRedirects(webAppUrl.trim(), req.toString());
+                    JSONObject json = new JSONObject(resp);
+                    JSONArray arr = json.optJSONArray("orders");
+                    final List<PendingQrOrder> list = new ArrayList<>();
+                    if (arr != null) {
+                        for (int i = 0; i < arr.length(); i++) {
+                            JSONObject o = arr.getJSONObject(i);
+                            PendingQrOrder po = new PendingQrOrder();
+                            po.orderId = o.optString("orderId", "QR-" + (i + 1));
+                            po.time = o.optString("time", "");
+                            po.table = o.optString("table", "1桌");
+                            po.paymentPref = o.optString("paymentPref", "現金");
+                            po.customerNote = o.optString("customerNote", "");
+                            po.total = o.optInt("total", 0);
+
+                            JSONArray itemsArr = o.optJSONArray("items");
+                            if (itemsArr != null) {
+                                for (int k = 0; k < itemsArr.length(); k++) {
+                                    JSONObject it = itemsArr.getJSONObject(k);
+                                    PendingQrItem pi = new PendingQrItem();
+                                    pi.name = it.optString("name", "");
+                                    pi.qty = Math.max(1, it.optInt("qty", 1));
+                                    pi.unitPrice = Math.max(0, it.optInt("unitPrice", 0));
+                                    pi.choice = it.optString("choice", "");
+                                    pi.sweet = it.optString("sweet", "5分半糖");
+                                    pi.ice = it.optString("ice", "8分少冰");
+                                    pi.mealDrinkName = it.optString("mealDrinkName", "毛尖綠茶");
+                                    pi.mealDrinkDiff = it.optInt("mealDrinkDiff", 0);
+                                    pi.mealDrinkSweet = it.optString("mealDrinkSweet", "無糖");
+                                    pi.mealDrinkIce = it.optString("mealDrinkIce", "3分微冰");
+                                    pi.note = it.optString("note", "");
+
+                                    JSONArray addArr = it.optJSONArray("addons");
+                                    if (addArr != null) {
+                                        for (int a = 0; a < addArr.length(); a++) {
+                                            JSONObject ao = addArr.getJSONObject(a);
+                                            pi.addons.add(new MainActivity.AddonOption(
+                                                ao.optString("name", ""), ao.optInt("price", 0)));
+                                        }
+                                    }
+                                    po.items.add(pi);
+                                }
+                            }
+                            list.add(po);
+                        }
+                    }
+                    MAIN_HANDLER.post(new Runnable() {
+                        @Override public void run() {
+                            if (callback != null) {
+                                callback.onResult(true, "✅ 已同步雲端掃碼訂單 (共 " + list.size() + " 筆待處理)", list);
+                            }
+                        }
+                    });
+                } catch (final Exception e) {
+                    MAIN_HANDLER.post(new Runnable() {
+                        @Override public void run() {
+                            if (callback != null) callback.onResult(false, "⚠️ 無法取得線上訂單：" + e.getMessage(), null);
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    // ==================== 5. 通知雲端將掃碼訂單標記為「已接單 (ACCEPTED)」或「已取消」 ====================
+    public static void ackQrOrderAsync(final String webAppUrl,
+                                       final String orderId,
+                                       final String newStatus,
+                                       final SyncCallback callback) {
+        if (!isValidWebAppUrl(webAppUrl)) return;
+        EXECUTOR.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject req = new JSONObject();
+                    req.put("action", "ack_qr_order");
+                    req.put("orderId", orderId);
+                    req.put("status", newStatus);
+                    String resp = postJsonFollowRedirects(webAppUrl.trim(), req.toString());
+                    postResult(callback, true, resp);
+                } catch (Exception e) {
+                    postResult(callback, false, e.getMessage());
                 }
             }
         });

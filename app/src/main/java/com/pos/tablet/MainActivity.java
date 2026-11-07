@@ -112,6 +112,40 @@ public class MainActivity extends Activity {
         public String note = "";
         public boolean printLabel;
         public boolean manualLabelOverride = false;
+        // 隨餐附贈/換購之飲料是否列印專屬飲料杯貼紙 (預設一律列印，解決餐點附贈飲料未印貼紙問題)
+        public boolean printDrinkLabel = true;
+        public boolean manualDrinkLabelOverride = false;
+
+        public boolean hasAttachedDrink() {
+            return menu != null && menu.hasFreeTea
+                && mealDrinkName != null && !mealDrinkName.isEmpty()
+                && !"不需附茶".equals(mealDrinkName);
+        }
+
+        public String getAttachedDrinkModSummary() {
+            List<String> dp = new ArrayList<>();
+            dp.add(mealDrinkSweet != null && !mealDrinkSweet.isEmpty() ? mealDrinkSweet : "無糖");
+            dp.add(mealDrinkIce != null && !mealDrinkIce.isEmpty() ? mealDrinkIce : "3分微冰");
+            for (AddonOption a : addons) {
+                if (a.name.contains("愛玉") || a.name.contains("椰果") || a.name.contains("奶")) {
+                    dp.add("+" + a.name + "($" + a.price + ")");
+                }
+            }
+            dp.add("隨餐:" + (menu != null ? menu.name : ""));
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < dp.size(); i++) {
+                if (i > 0) sb.append(" / ");
+                sb.append(dp.get(i));
+            }
+            return sb.toString();
+        }
+
+        public int getItemStickerCount() {
+            int c = 0;
+            if (printLabel) c += qty;
+            if (hasAttachedDrink() && printDrinkLabel) c += qty;
+            return c;
+        }
 
         public int getAddonSum() {
             int s = 0;
@@ -265,12 +299,12 @@ public class MainActivity extends Activity {
 
     // ==================== UI REFERENCES ====================
     private TextView tvTopCallNum;
-    private Button btnTabPos, btnTabOrders, btnTabClosing, btnTabSettings;
+    private Button btnTabPos, btnTabQrOrders, btnTabOrders, btnTabClosing, btnTabSettings;
     private LinearLayout viewPos, viewOrders, viewClosing, viewSettings;
 
     // POS Tab views
-    private Button btnTypeDineIn, btnTypeTakeout, btnTypeUber, btnTypePanda;
-    private Spinner spTable;
+    private Button btnTypeDineIn, btnTypeTakeout, btnTypeDelivery, btnTypeUber, btnTypePanda;
+    private Button btnSelectTable;
     private LinearLayout llCategoryBar;
     private LinearLayout llBrothQuickBar;
     private GridLayout glMenuGrid;
@@ -278,6 +312,16 @@ public class MainActivity extends Activity {
     private LinearLayout llCartList;
     private CheckBox cbGlobalReceipt, cbGlobalLabels;
     private TextView tvCartSummary, tvCartGrandTotal;
+
+    // 視覺化餐廳桌位平面圖 (5欄 x 4列 = 20格，預設配置 1~13 桌 + 吧台，可自由移位與增減桌號)
+    private static final int FLOOR_COLS = 5;
+    private static final int FLOOR_ROWS = 4;
+    private static final int FLOOR_TOTAL_SLOTS = FLOOR_COLS * FLOOR_ROWS; // 20 格
+    private final String[] tableFloorSlots = new String[FLOOR_TOTAL_SLOTS];
+
+    // 雲端「📱 客人掃碼線上點餐」待接訂單佇列
+    private final List<CloudSyncManager.PendingQrOrder> pendingQrOrders = new ArrayList<>();
+    private final android.os.Handler qrPollHandler = new android.os.Handler();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -298,6 +342,100 @@ public class MainActivity extends Activity {
         updateOrdersBadge();
         refreshAllPosViews();
         handleIncomingConfigIntent();
+        startQrOrderAutoPoller();
+    }
+
+    private void startQrOrderAutoPoller() {
+        qrPollHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (googleSheetUrl != null && !googleSheetUrl.trim().isEmpty()) {
+                    CloudSyncManager.fetchPendingQrOrdersAsync(googleSheetUrl, new CloudSyncManager.QrOrdersCallback() {
+                        @Override
+                        public void onResult(boolean ok, String msg, List<CloudSyncManager.PendingQrOrder> list) {
+                            if (ok && list != null) {
+                                int prevSize = pendingQrOrders.size();
+                                pendingQrOrders.clear();
+                                pendingQrOrders.addAll(list);
+                                updateQrOrdersBadge();
+                                if (list.size() > prevSize) {
+                                    Toast.makeText(MainActivity.this,
+                                        "🔔 收到新的客人手機掃碼點餐訂單！(共 " + list.size() + " 筆待接單)",
+                                        Toast.LENGTH_LONG).show();
+                                }
+                            }
+                        }
+                    });
+                }
+                qrPollHandler.postDelayed(this, 25000);
+            }
+        }, 5000);
+    }
+
+    private void updateQrOrdersBadge() {
+        if (btnTabQrOrders != null) {
+            int cnt = pendingQrOrders.size();
+            btnTabQrOrders.setText(cnt > 0 ? "🔔 掃碼待接(" + cnt + ")" : "📱 掃碼點餐/桌牌");
+            if (cnt > 0) {
+                btnTabQrOrders.setTextColor(Color.BLACK);
+                btnTabQrOrders.setBackground(roundBg(Color.parseColor("#F59E0B"), Color.WHITE, 2, 8));
+            } else {
+                styleTopTabBtn(btnTabQrOrders, false);
+            }
+        }
+    }
+
+    private void initDefaultTableFloorSlots() {
+        for (int i = 0; i < FLOOR_TOTAL_SLOTS; i++) tableFloorSlots[i] = "";
+        // 預設配置 1桌 ~ 13桌 + 吧台，留出走道格位供店家自由視覺化排桌
+        tableFloorSlots[0] = "1桌";
+        tableFloorSlots[1] = "2桌";
+        tableFloorSlots[2] = "3桌";
+        tableFloorSlots[3] = "4桌";
+        tableFloorSlots[4] = "5桌";
+        tableFloorSlots[5] = "6桌";
+        tableFloorSlots[6] = "7桌";
+        tableFloorSlots[8] = "8桌";
+        tableFloorSlots[9] = "9桌";
+        tableFloorSlots[10] = "10桌";
+        tableFloorSlots[11] = "11桌";
+        tableFloorSlots[13] = "12桌";
+        tableFloorSlots[14] = "13桌";
+        tableFloorSlots[19] = "吧台";
+    }
+
+    private void loadTableFloorSlotsFromDb() {
+        String raw = dbHelper.getSetting("table_floor_slots", "");
+        if (raw == null || raw.trim().isEmpty()) {
+            initDefaultTableFloorSlots();
+            saveTableFloorSlotsToDb();
+            return;
+        }
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray(raw);
+            for (int i = 0; i < FLOOR_TOTAL_SLOTS; i++) {
+                tableFloorSlots[i] = (i < arr.length()) ? arr.optString(i, "") : "";
+            }
+        } catch (Exception e) {
+            initDefaultTableFloorSlots();
+        }
+    }
+
+    private void saveTableFloorSlotsToDb() {
+        org.json.JSONArray arr = new org.json.JSONArray();
+        for (int i = 0; i < FLOOR_TOTAL_SLOTS; i++) {
+            arr.put(tableFloorSlots[i] != null ? tableFloorSlots[i] : "");
+        }
+        dbHelper.setSetting("table_floor_slots", arr.toString());
+    }
+
+    private List<String> getActiveTableNames() {
+        List<String> list = new ArrayList<>();
+        for (String s : tableFloorSlots) {
+            if (s != null && !s.trim().isEmpty()) list.add(s.trim());
+        }
+        if (list.isEmpty()) list.add("1桌");
+        return list;
     }
 
     private void handleIncomingConfigIntent() {
@@ -342,6 +480,7 @@ public class MainActivity extends Activity {
         PosPrintEngine.labelFontScalePercent = dbHelper.getIntSetting("label_font_scale", 115);
         PosPrintEngine.labelMarginDots = dbHelper.getIntSetting("label_margin_dots", 12);
         googleSheetUrl = dbHelper.getSetting("google_sheet_url", "");
+        loadTableFloorSlotsFromDb();
 
         ordersHistory.clear();
         ordersHistory.addAll(dbHelper.loadActiveOrders(menuItems));
@@ -536,17 +675,21 @@ public class MainActivity extends Activity {
         btnTabPos = makeTopTabBtn("🍔 點餐結帳", true, new View.OnClickListener() {
             @Override public void onClick(View v) { switchMainTab(0); }
         });
+        btnTabQrOrders = makeTopTabBtn("📱 掃碼點餐/桌牌", false, new View.OnClickListener() {
+            @Override public void onClick(View v) { showQrOrdersAndStandeeDialog(); }
+        });
         btnTabOrders = makeTopTabBtn("📋 當日訂單 (0)", false, new View.OnClickListener() {
             @Override public void onClick(View v) { switchMainTab(1); }
         });
         btnTabClosing = makeTopTabBtn("📊 每日關帳", false, new View.OnClickListener() {
             @Override public void onClick(View v) { switchMainTab(2); }
         });
-        btnTabSettings = makeTopTabBtn("⚙️ 雙機與菜單設定", false, new View.OnClickListener() {
+        btnTabSettings = makeTopTabBtn("⚙️ 雙機與設定", false, new View.OnClickListener() {
             @Override public void onClick(View v) { switchMainTab(3); }
         });
 
         topBar.addView(btnTabPos);
+        topBar.addView(btnTabQrOrders);
         topBar.addView(btnTabOrders);
         topBar.addView(btnTabClosing);
         topBar.addView(btnTabSettings);
@@ -636,36 +779,35 @@ public class MainActivity extends Activity {
         typeBar.setGravity(Gravity.CENTER_VERTICAL);
 
         btnTypeDineIn = makeOrderTypeBtn("🏠 內用", "內用");
-        btnTypeTakeout = makeOrderTypeBtn("🛍️ 外帶(貼紙)", "外帶");
-        btnTypeUber = makeOrderTypeBtn("🛵 UberEats", "UberEats");
-        btnTypePanda = makeOrderTypeBtn("🐼 Foodpanda", "Foodpanda");
+        btnTypeTakeout = makeOrderTypeBtn("🛍️ 外帶", "外帶");
+        btnTypeDelivery = makeOrderTypeBtn("🛵 外送", "外送");
+        btnTypeUber = makeOrderTypeBtn("🛵 Uber", "UberEats");
+        btnTypePanda = makeOrderTypeBtn("🐼 熊貓", "Foodpanda");
 
-        final String[] tables = {"1桌", "2桌", "3桌", "4桌", "5桌", "6桌", "7桌", "8桌", "吧台"};
-        spTable = new Spinner(this);
-        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, tables);
-        spTable.setAdapter(adapter);
-        spTable.setBackground(roundBg(Color.parseColor("#1E293B"), Color.parseColor("#38BDF8"), 1, 6));
-        spTable.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
-                currentTable = tables[position];
-                if (view instanceof TextView) {
-                    ((TextView) view).setTextColor(Color.WHITE);
-                    ((TextView) view).setTextSize(13);
-                }
-                refreshCartUI();
+        btnSelectTable = new Button(this);
+        btnSelectTable.setText("🗺️ " + currentTable + " ▾");
+        btnSelectTable.setAllCaps(false);
+        btnSelectTable.setTextSize(12);
+        btnSelectTable.setTypeface(null, Typeface.BOLD);
+        btnSelectTable.setTextColor(Color.parseColor("#FCD34D"));
+        btnSelectTable.setPadding(dp(4), dp(2), dp(4), dp(2));
+        btnSelectTable.setBackground(roundBg(Color.parseColor("#0F172A"), Color.parseColor("#38BDF8"), 2, 7));
+        btnSelectTable.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                showVisualTableMapDialog();
             }
-            @Override public void onNothingSelected(AdapterView<?> parent) {}
         });
 
         LinearLayout.LayoutParams lpTypeBtn = new LinearLayout.LayoutParams(0, dp(38), 1f);
         lpTypeBtn.rightMargin = dp(4);
         typeBar.addView(btnTypeDineIn, lpTypeBtn);
 
-        LinearLayout.LayoutParams lpSpinner = new LinearLayout.LayoutParams(dp(84), dp(38));
-        lpSpinner.rightMargin = dp(4);
-        typeBar.addView(spTable, lpSpinner);
+        LinearLayout.LayoutParams lpTableBtn = new LinearLayout.LayoutParams(dp(92), dp(38));
+        lpTableBtn.rightMargin = dp(4);
+        typeBar.addView(btnSelectTable, lpTableBtn);
 
         typeBar.addView(btnTypeTakeout, lpTypeBtn);
+        typeBar.addView(btnTypeDelivery, lpTypeBtn);
         typeBar.addView(btnTypeUber, lpTypeBtn);
         LinearLayout.LayoutParams lpLastType = new LinearLayout.LayoutParams(0, dp(38), 1f);
         typeBar.addView(btnTypePanda, lpLastType);
@@ -881,9 +1023,13 @@ public class MainActivity extends Activity {
     }
 
     private void refreshOrderTypeButtons() {
-        spTable.setVisibility("內用".equals(currentOrderType) ? View.VISIBLE : View.GONE);
+        if (btnSelectTable != null) {
+            btnSelectTable.setVisibility("內用".equals(currentOrderType) ? View.VISIBLE : View.GONE);
+            btnSelectTable.setText("🗺️ " + currentTable + " ▾");
+        }
         styleTypeBtn(btnTypeDineIn, "內用".equals(currentOrderType), "#38BDF8");
         styleTypeBtn(btnTypeTakeout, "外帶".equals(currentOrderType), "#10B981");
+        styleTypeBtn(btnTypeDelivery, "外送".equals(currentOrderType), "#F59E0B");
         styleTypeBtn(btnTypeUber, "UberEats".equals(currentOrderType), "#22C55E");
         styleTypeBtn(btnTypePanda, "Foodpanda".equals(currentOrderType), "#EC4899");
     }
@@ -1121,7 +1267,7 @@ public class MainActivity extends Activity {
         if (!globalPrintLabels) return 0;
         int c = 0;
         for (CartItem ci : cart) {
-            if (ci.printLabel) c += ci.qty;
+            c += ci.getItemStickerCount();
         }
         return c;
     }
@@ -1133,9 +1279,13 @@ public class MainActivity extends Activity {
     }
 
     private void refreshCartUI() {
-        String typeDisplay = "內用".equals(currentOrderType) ? "🏠 內用 (" + currentTable + ")" : "🛍️ " + currentOrderType;
+        String typeDisplay = "內用".equals(currentOrderType)
+            ? "🏠 內用 (" + currentTable + ")"
+            : ("外送".equals(currentOrderType) ? "🛵 外送" : "🛍️ " + currentOrderType);
         tvCartHeaderType.setText(typeDisplay);
-        tvCartRuleHint.setText("內用".equals(currentOrderType) ? "預設：飲料印貼紙、餐點不印" : "預設：外帶/外送全品項印貼紙");
+        tvCartRuleHint.setText("內用".equals(currentOrderType)
+            ? "預設：單點飲料與隨餐附飲印貼紙、內用餐盒不印"
+            : "預設：外帶/外送全品項(含附餐飲品)皆印貼紙");
 
         llCartList.removeAllViews();
         if (cart.isEmpty()) {
@@ -1232,16 +1382,20 @@ public class MainActivity extends Activity {
                 });
                 row.addView(tvMods);
 
-                // Controls: Sticker Checkbox + Qty - / +
+                // Controls: Sticker Checkbox(es) + Qty - / +
                 LinearLayout ctrlLine = new LinearLayout(this);
                 ctrlLine.setOrientation(LinearLayout.HORIZONTAL);
                 ctrlLine.setGravity(Gravity.CENTER_VERTICAL);
                 ctrlLine.setPadding(0, dp(2), 0, 0);
 
                 CheckBox cbSticker = new CheckBox(this);
-                cbSticker.setText(ci.printLabel ? "🏷️ 印貼紙(" + ci.qty + "張)" : "🏷️ 不印貼紙");
+                if (ci.hasAttachedDrink()) {
+                    cbSticker.setText(ci.printLabel ? "🏷️餐盒(" + ci.qty + ")" : "🏷️餐盒不印");
+                } else {
+                    cbSticker.setText(ci.printLabel ? "🏷️ 印貼紙(" + ci.qty + "張)" : "🏷️ 不印貼紙");
+                }
                 cbSticker.setTextColor(ci.printLabel ? Color.parseColor("#6EE7B7") : Color.parseColor("#94A3B8"));
-                cbSticker.setTextSize(12);
+                cbSticker.setTextSize(11);
                 cbSticker.setChecked(ci.printLabel);
                 cbSticker.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
                     @Override public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
@@ -1250,7 +1404,28 @@ public class MainActivity extends Activity {
                         refreshCartUI();
                     }
                 });
-                ctrlLine.addView(cbSticker, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                if (ci.hasAttachedDrink()) {
+                    ctrlLine.addView(cbSticker, new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                    CheckBox cbDrinkSticker = new CheckBox(this);
+                    cbDrinkSticker.setText(ci.printDrinkLabel ? "🥤附飲(" + ci.qty + "張)" : "🥤附飲不印");
+                    cbDrinkSticker.setTextColor(ci.printDrinkLabel ? Color.parseColor("#38BDF8") : Color.parseColor("#94A3B8"));
+                    cbDrinkSticker.setTextSize(11);
+                    cbDrinkSticker.setChecked(ci.printDrinkLabel);
+                    cbDrinkSticker.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+                        @Override public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
+                            ci.printDrinkLabel = isChecked;
+                            ci.manualDrinkLabelOverride = true;
+                            refreshCartUI();
+                        }
+                    });
+                    ctrlLine.addView(cbDrinkSticker, new LinearLayout.LayoutParams(
+                        0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                } else {
+                    ctrlLine.addView(cbSticker, new LinearLayout.LayoutParams(
+                        0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                }
 
                 Button btnMinus = new Button(this);
                 btnMinus.setText("−");
@@ -1840,6 +2015,767 @@ public class MainActivity extends Activity {
             .show();
     }
 
+    // ==================== 視覺化餐廳桌位平面圖點選 & 自由排桌設定系統 (1~13桌 + 自訂排桌) ====================
+    private void showVisualTableMapDialog() {
+        int screenW = getResources().getDisplayMetrics().widthPixels;
+        int screenH = getResources().getDisplayMetrics().heightPixels;
+        final int dialogW = (int) (screenW * 0.92f);
+        final int dialogH = (int) (screenH * 0.90f);
+
+        final android.app.Dialog dialog = new android.app.Dialog(this);
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackground(roundBg(Color.parseColor("#0F172A"), Color.parseColor("#38BDF8"), 2, 10));
+
+        // 頂部標題與「自由排桌編輯模式」切換列
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setBackgroundColor(Color.parseColor("#062419"));
+        header.setPadding(dp(12), dp(6), dp(12), dp(6));
+
+        final TextView tvTitle = new TextView(this);
+        tvTitle.setText("🗺️ 伊凡的花園 — 視覺化桌位點選 (點擊桌位立即帶入，預設 1~13 桌)");
+        tvTitle.setTextColor(Color.parseColor("#A7F3D0"));
+        tvTitle.setTextSize(15);
+        tvTitle.setTypeface(null, Typeface.BOLD);
+        header.addView(tvTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        final boolean[] editMode = {false};
+        final int[] movingSlotIdx = {-1};
+
+        final Button btnToggleEdit = new Button(this);
+        btnToggleEdit.setText("✏️ 自由排桌 / 增減桌號");
+        btnToggleEdit.setAllCaps(false);
+        btnToggleEdit.setTextSize(12);
+        btnToggleEdit.setTypeface(null, Typeface.BOLD);
+        btnToggleEdit.setTextColor(Color.WHITE);
+        btnToggleEdit.setBackground(roundBg(Color.parseColor("#0284C7"), 0, 0, 6));
+        header.addView(btnToggleEdit, new LinearLayout.LayoutParams(dp(155), dp(34)));
+
+        Button btnClose = new Button(this);
+        btnClose.setText("✖ 關閉");
+        btnClose.setAllCaps(false);
+        btnClose.setTextSize(12);
+        btnClose.setTextColor(Color.WHITE);
+        btnClose.setBackground(roundBg(Color.parseColor("#475569"), 0, 0, 6));
+        btnClose.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { dialog.dismiss(); }
+        });
+        LinearLayout.LayoutParams lpClose = new LinearLayout.LayoutParams(dp(75), dp(34));
+        lpClose.leftMargin = dp(6);
+        header.addView(btnClose, lpClose);
+
+        root.addView(header, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)));
+
+        // 編輯工具列 (僅在編輯排桌模式開啟時顯示)
+        final LinearLayout editToolbar = new LinearLayout(this);
+        editToolbar.setOrientation(LinearLayout.HORIZONTAL);
+        editToolbar.setGravity(Gravity.CENTER_VERTICAL);
+        editToolbar.setBackgroundColor(Color.parseColor("#1E293B"));
+        editToolbar.setPadding(dp(12), dp(6), dp(12), dp(6));
+        editToolbar.setVisibility(View.GONE);
+
+        final TextView tvEditHint = new TextView(this);
+        tvEditHint.setText("💡 排桌操作：先點選任一桌(黃框)，再點選空位或另一桌即可移位/對調！");
+        tvEditHint.setTextColor(Color.parseColor("#FCD34D"));
+        tvEditHint.setTextSize(12);
+        tvEditHint.setTypeface(null, Typeface.BOLD);
+        editToolbar.addView(tvEditHint, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        Button btnAddTable = makeMiniTuneBtn("➕ 新增桌號", null);
+        btnAddTable.setBackground(roundBg(Color.parseColor("#10B981"), 0, 0, 6));
+        btnAddTable.setTextColor(Color.parseColor("#052E16"));
+
+        Button btnRenameTable = makeMiniTuneBtn("✏️ 修改桌名", null);
+        Button btnDeleteTable = makeMiniTuneBtn("🗑️ 刪除選取桌", null);
+        btnDeleteTable.setBackground(roundBg(Color.parseColor("#EF4444"), 0, 0, 6));
+
+        Button btnResetTables = makeMiniTuneBtn("🔄 重設預設1~13桌", null);
+
+        LinearLayout.LayoutParams lpTool = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32));
+        lpTool.leftMargin = dp(6);
+        editToolbar.addView(btnAddTable, lpTool);
+        editToolbar.addView(btnRenameTable, lpTool);
+        editToolbar.addView(btnDeleteTable, lpTool);
+        editToolbar.addView(btnResetTables, lpTool);
+        root.addView(editToolbar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // 統計今日各桌內用未作廢訂單金額 (供平面圖顯示「用餐中」狀態)
+        final Map<String, Integer> tableActiveAmount = new LinkedHashMap<>();
+        for (OrderRecord o : ordersHistory) {
+            if (!o.voided && o.orderType != null && o.orderType.startsWith("內用(") && o.orderType.endsWith(")")) {
+                String tName = o.orderType.substring(3, o.orderType.length() - 1);
+                int prev = tableActiveAmount.containsKey(tName) ? tableActiveAmount.get(tName) : 0;
+                tableActiveAmount.put(tName, prev + o.total);
+            }
+        }
+
+        // 中間 5x4 餐廳平面圖網格區
+        final LinearLayout mapGridContainer = new LinearLayout(this);
+        mapGridContainer.setOrientation(LinearLayout.VERTICAL);
+        mapGridContainer.setPadding(dp(12), dp(10), dp(12), dp(10));
+        root.addView(mapGridContainer, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        final Runnable rebuildFloorMap = new Runnable() {
+            @Override
+            public void run() {
+                mapGridContainer.removeAllViews();
+                for (int r = 0; r < FLOOR_ROWS; r++) {
+                    LinearLayout row = new LinearLayout(MainActivity.this);
+                    row.setOrientation(LinearLayout.HORIZONTAL);
+                    LinearLayout.LayoutParams lpRow = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+                    lpRow.bottomMargin = dp(6);
+                    row.setLayoutParams(lpRow);
+
+                    for (int c = 0; c < FLOOR_COLS; c++) {
+                        final int slotIdx = r * FLOOR_COLS + c;
+                        final String tName = tableFloorSlots[slotIdx] != null ? tableFloorSlots[slotIdx].trim() : "";
+                        final boolean isEmptySlot = tName.isEmpty();
+
+                        Button cell = new Button(MainActivity.this);
+                        cell.setAllCaps(false);
+                        cell.setPadding(dp(4), dp(4), dp(4), dp(4));
+
+                        LinearLayout.LayoutParams lpCell = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+                        lpCell.setMargins(dp(4), dp(2), dp(4), dp(2));
+
+                        if (editMode[0]) {
+                            boolean isSelectedForMove = (movingSlotIdx[0] == slotIdx);
+                            if (isEmptySlot) {
+                                cell.setText("＋ 空位格 (" + (slotIdx + 1) + ")\n(可移至此處)");
+                                cell.setTextSize(11);
+                                cell.setTextColor(Color.parseColor("#64748B"));
+                                cell.setBackground(roundBg(
+                                    Color.parseColor("#0F172A"),
+                                    isSelectedForMove ? Color.parseColor("#FCD34D") : Color.parseColor("#334155"),
+                                    isSelectedForMove ? 3 : 1, 8));
+                            } else {
+                                cell.setText("🪑 " + tName + "\n" + (isSelectedForMove ? "⚡ 請點目標位置" : "(點我移動/編輯)"));
+                                cell.setTextSize(13);
+                                cell.setTypeface(null, Typeface.BOLD);
+                                cell.setTextColor(isSelectedForMove ? Color.BLACK : Color.WHITE);
+                                cell.setBackground(roundBg(
+                                    isSelectedForMove ? Color.parseColor("#FCD34D") : Color.parseColor("#1E293B"),
+                                    isSelectedForMove ? Color.WHITE : Color.parseColor("#38BDF8"),
+                                    isSelectedForMove ? 3 : 2, 10));
+                            }
+                            cell.setOnClickListener(new View.OnClickListener() {
+                                @Override
+                                public void onClick(View v) {
+                                    if (movingSlotIdx[0] == -1) {
+                                        if (!isEmptySlot) {
+                                            movingSlotIdx[0] = slotIdx;
+                                            tvEditHint.setText("⚡ 已選取【" + tName + "】➔ 請點選平面圖任一空位或另一桌進行移動/互換！");
+                                            run();
+                                        }
+                                    } else if (movingSlotIdx[0] == slotIdx) {
+                                        movingSlotIdx[0] = -1;
+                                        tvEditHint.setText("💡 排桌操作：先點選任一桌(黃框)，再點選空位或另一桌即可移位/對調！");
+                                        run();
+                                    } else {
+                                        // 對調位置並儲存至 SQLite
+                                        String srcTable = tableFloorSlots[movingSlotIdx[0]];
+                                        tableFloorSlots[movingSlotIdx[0]] = tableFloorSlots[slotIdx];
+                                        tableFloorSlots[slotIdx] = srcTable;
+                                        movingSlotIdx[0] = -1;
+                                        saveTableFloorSlotsToDb();
+                                        tvEditHint.setText("✅ 已移動【" + srcTable + "】並儲存桌位排列！");
+                                        run();
+                                    }
+                                }
+                            });
+                        } else {
+                            // 一般點餐選桌模式
+                            if (isEmptySlot) {
+                                cell.setText("走道 / 空位");
+                                cell.setTextSize(10);
+                                cell.setTextColor(Color.parseColor("#334155"));
+                                cell.setBackground(roundBg(Color.parseColor("#0B1324"), Color.parseColor("#1E293B"), 1, 8));
+                                cell.setEnabled(false);
+                            } else {
+                                boolean isCurrent = tName.equals(currentTable);
+                                int activeAmt = tableActiveAmount.containsKey(tName) ? tableActiveAmount.get(tName) : 0;
+                                String statusLine = isCurrent
+                                    ? "✔ 目前選取中"
+                                    : (activeAmt > 0 ? "🍽️ 今日消費 $" + activeAmt : "🟢 點擊選此桌");
+                                cell.setText("🪑 " + tName + "\n" + statusLine);
+                                cell.setTextSize(14);
+                                cell.setTypeface(null, Typeface.BOLD);
+                                if (isCurrent) {
+                                    cell.setTextColor(Color.parseColor("#052E16"));
+                                    cell.setBackground(roundBg(Color.parseColor("#10B981"), Color.parseColor("#6EE7B7"), 3, 10));
+                                } else if (activeAmt > 0) {
+                                    cell.setTextColor(Color.WHITE);
+                                    cell.setBackground(roundBg(Color.parseColor("#B45309"), Color.parseColor("#FCD34D"), 2, 10));
+                                } else {
+                                    cell.setTextColor(Color.WHITE);
+                                    cell.setBackground(roundBg(Color.parseColor("#1E293B"), Color.parseColor("#475569"), 1, 10));
+                                }
+                                cell.setOnClickListener(new View.OnClickListener() {
+                                    @Override
+                                    public void onClick(View v) {
+                                        currentOrderType = "內用";
+                                        currentTable = tName;
+                                        for (CartItem ci : cart) {
+                                            if (!ci.manualLabelOverride) {
+                                                ci.printLabel = shouldPrintLabelByDefault(ci.menu.isDrink, currentOrderType);
+                                            }
+                                        }
+                                        refreshOrderTypeButtons();
+                                        refreshCartUI();
+                                        dialog.dismiss();
+                                    }
+                                });
+                            }
+                        }
+                        row.addView(cell, lpCell);
+                    }
+                    mapGridContainer.addView(row);
+                }
+            }
+        };
+
+        btnToggleEdit.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                editMode[0] = !editMode[0];
+                movingSlotIdx[0] = -1;
+                editToolbar.setVisibility(editMode[0] ? View.VISIBLE : View.GONE);
+                btnToggleEdit.setText(editMode[0] ? "✅ 完成排桌返回點選" : "✏️ 自由排桌 / 增減桌號");
+                btnToggleEdit.setBackground(roundBg(
+                    editMode[0] ? Color.parseColor("#10B981") : Color.parseColor("#0284C7"), 0, 0, 6));
+                btnToggleEdit.setTextColor(editMode[0] ? Color.parseColor("#052E16") : Color.WHITE);
+                tvTitle.setText(editMode[0]
+                    ? "✏️ 餐廳桌位排列編輯模式 (點選桌號再點空位即可自由排列位置)"
+                    : "🗺️ 伊凡的花園 — 視覺化桌位點選 (點擊桌位立即帶入，預設 1~13 桌)");
+                rebuildFloorMap.run();
+            }
+        });
+
+        btnAddTable.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                int emptyIdx = -1;
+                for (int i = 0; i < FLOOR_TOTAL_SLOTS; i++) {
+                    if (tableFloorSlots[i] == null || tableFloorSlots[i].trim().isEmpty()) {
+                        emptyIdx = i;
+                        break;
+                    }
+                }
+                if (emptyIdx == -1) {
+                    Toast.makeText(MainActivity.this, "20 個平面圖格位已滿，請先刪除不需要的桌號", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                final int targetSlot = emptyIdx;
+                final EditText et = new EditText(MainActivity.this);
+                int nextNum = getActiveTableNames().size() + 1;
+                et.setText(nextNum + "桌");
+                et.setTextColor(Color.BLACK);
+                new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("➕ 新增桌號")
+                    .setMessage("請輸入新桌號名稱（例如：14桌、VIP桌、戶外1）：")
+                    .setView(et)
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("新增", new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface d, int w) {
+                            String name = et.getText().toString().trim();
+                            if (!name.isEmpty()) {
+                                tableFloorSlots[targetSlot] = name;
+                                saveTableFloorSlotsToDb();
+                                rebuildFloorMap.run();
+                            }
+                        }
+                    })
+                    .show();
+            }
+        });
+
+        btnRenameTable.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (movingSlotIdx[0] < 0 || movingSlotIdx[0] >= FLOOR_TOTAL_SLOTS
+                    || tableFloorSlots[movingSlotIdx[0]].trim().isEmpty()) {
+                    Toast.makeText(MainActivity.this, "請先在下方點選要改名的桌號(黃框)！", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                final int targetIdx = movingSlotIdx[0];
+                final EditText et = new EditText(MainActivity.this);
+                et.setText(tableFloorSlots[targetIdx]);
+                new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("✏️ 修改桌號名稱")
+                    .setView(et)
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("儲存", new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface d, int w) {
+                            String n = et.getText().toString().trim();
+                            if (!n.isEmpty()) {
+                                tableFloorSlots[targetIdx] = n;
+                                currentTable = n;
+                                movingSlotIdx[0] = -1;
+                                saveTableFloorSlotsToDb();
+                                refreshOrderTypeButtons();
+                                rebuildFloorMap.run();
+                            }
+                        }
+                    })
+                    .show();
+            }
+        });
+
+        btnDeleteTable.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (movingSlotIdx[0] < 0 || movingSlotIdx[0] >= FLOOR_TOTAL_SLOTS
+                    || tableFloorSlots[movingSlotIdx[0]].trim().isEmpty()) {
+                    Toast.makeText(MainActivity.this, "請先在下方點選要刪除的桌號(黃框)！", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                String removed = tableFloorSlots[movingSlotIdx[0]];
+                tableFloorSlots[movingSlotIdx[0]] = "";
+                movingSlotIdx[0] = -1;
+                saveTableFloorSlotsToDb();
+                Toast.makeText(MainActivity.this, "已移除【" + removed + "】", Toast.LENGTH_SHORT).show();
+                rebuildFloorMap.run();
+            }
+        });
+
+        btnResetTables.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                initDefaultTableFloorSlots();
+                movingSlotIdx[0] = -1;
+                saveTableFloorSlotsToDb();
+                Toast.makeText(MainActivity.this, "✅ 已重設為 1桌 ~ 13桌 + 吧台 預設排列", Toast.LENGTH_SHORT).show();
+                rebuildFloorMap.run();
+            }
+        });
+
+        rebuildFloorMap.run();
+        dialog.setContentView(root, new ViewGroup.LayoutParams(dialogW, dialogH));
+        dialog.show();
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+            dialog.getWindow().setLayout(dialogW, dialogH);
+        }
+    }
+
+    // ==================== 📱 掃碼線上點餐待接單中心 & 各桌 QR Code 立牌列印系統 ====================
+    private void showQrOrdersAndStandeeDialog() {
+        int screenW = getResources().getDisplayMetrics().widthPixels;
+        int screenH = getResources().getDisplayMetrics().heightPixels;
+        final int dialogW = (int) (screenW * 0.94f);
+        final int dialogH = (int) (screenH * 0.90f);
+
+        final android.app.Dialog dialog = new android.app.Dialog(this);
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackground(roundBg(Color.parseColor("#0F172A"), Color.parseColor("#10B981"), 2, 10));
+
+        // 頂部標題列
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setBackgroundColor(Color.parseColor("#062419"));
+        header.setPadding(dp(12), dp(6), dp(12), dp(6));
+
+        TextView tvTitle = new TextView(this);
+        tvTitle.setText("📱 客人掃碼線上點餐接單中心 & 各桌 QR Code 立牌列印");
+        tvTitle.setTextColor(Color.parseColor("#A7F3D0"));
+        tvTitle.setTextSize(15);
+        tvTitle.setTypeface(null, Typeface.BOLD);
+        header.addView(tvTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        final Button btnRefreshQr = new Button(this);
+        btnRefreshQr.setText("🔄 立即刷新雲端掃碼單");
+        btnRefreshQr.setAllCaps(false);
+        btnRefreshQr.setTextSize(12);
+        btnRefreshQr.setTypeface(null, Typeface.BOLD);
+        btnRefreshQr.setTextColor(Color.parseColor("#052E16"));
+        btnRefreshQr.setBackground(roundBg(Color.parseColor("#38BDF8"), 0, 0, 6));
+        header.addView(btnRefreshQr, new LinearLayout.LayoutParams(dp(165), dp(34)));
+
+        Button btnClose = new Button(this);
+        btnClose.setText("✖ 關閉");
+        btnClose.setAllCaps(false);
+        btnClose.setTextSize(12);
+        btnClose.setTextColor(Color.WHITE);
+        btnClose.setBackground(roundBg(Color.parseColor("#475569"), 0, 0, 6));
+        btnClose.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { dialog.dismiss(); }
+        });
+        LinearLayout.LayoutParams lpClose = new LinearLayout.LayoutParams(dp(75), dp(34));
+        lpClose.leftMargin = dp(8);
+        header.addView(btnClose, lpClose);
+        root.addView(header, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)));
+
+        // 左右雙欄配置：左欄 = 🔔 待接線上掃碼訂單佇列 (55%)，右欄 = 🖨️ 各桌掃碼點餐 QR Code 立牌產生與列印 (45%)
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.HORIZONTAL);
+        content.setPadding(dp(10), dp(8), dp(10), dp(10));
+        root.addView(content, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // --- 左欄：待接線上掃碼訂單 ---
+        LinearLayout leftCol = new LinearLayout(this);
+        leftCol.setOrientation(LinearLayout.VERTICAL);
+        leftCol.setBackground(roundBg(Color.parseColor("#1E293B"), Color.parseColor("#334155"), 1, 8));
+        leftCol.setPadding(dp(10), dp(8), dp(10), dp(8));
+
+        final TextView tvQueueHeader = new TextView(this);
+        tvQueueHeader.setText("🔔 客人手機掃碼待接訂單 (" + pendingQrOrders.size() + " 筆)");
+        tvQueueHeader.setTextColor(Color.parseColor("#FCD34D"));
+        tvQueueHeader.setTextSize(14);
+        tvQueueHeader.setTypeface(null, Typeface.BOLD);
+        leftCol.addView(tvQueueHeader);
+
+        ScrollView svQueue = new ScrollView(this);
+        final LinearLayout llQueueList = new LinearLayout(this);
+        llQueueList.setOrientation(LinearLayout.VERTICAL);
+        llQueueList.setPadding(0, dp(6), 0, dp(6));
+        svQueue.addView(llQueueList);
+        leftCol.addView(svQueue, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        final Runnable rebuildQrQueueUI = new Runnable() {
+            @Override
+            public void run() {
+                tvQueueHeader.setText("🔔 客人手機掃碼待接訂單 (" + pendingQrOrders.size() + " 筆)");
+                llQueueList.removeAllViews();
+                if (pendingQrOrders.isEmpty()) {
+                    TextView tvEmpty = new TextView(MainActivity.this);
+                    tvEmpty.setText("目前尚無待處理的手機掃碼訂單。\n\n"
+                        + "💡 使用方式：\n"
+                        + "1. 請確認已更新 Google 試算表 Apps Script 並部署新版本。\n"
+                        + "2. 點擊右側【🖨️ 用出單機印出本桌 QR Code 立牌】貼於 1~13 號餐桌。\n"
+                        + "3. 客人用手機相機或 LINE 掃描後即可直接點餐，送出後會自動出現在此處！");
+                    tvEmpty.setTextColor(Color.parseColor("#94A3B8"));
+                    tvEmpty.setTextSize(12);
+                    tvEmpty.setPadding(dp(6), dp(16), dp(6), dp(16));
+                    llQueueList.addView(tvEmpty);
+                    return;
+                }
+                for (int i = 0; i < pendingQrOrders.size(); i++) {
+                    final CloudSyncManager.PendingQrOrder po = pendingQrOrders.get(i);
+                    LinearLayout card = new LinearLayout(MainActivity.this);
+                    card.setOrientation(LinearLayout.VERTICAL);
+                    card.setBackground(roundBg(Color.parseColor("#0F172A"), Color.parseColor("#F59E0B"), 1, 8));
+                    card.setPadding(dp(10), dp(8), dp(10), dp(8));
+                    LinearLayout.LayoutParams lpC = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                    lpC.bottomMargin = dp(8);
+                    card.setLayoutParams(lpC);
+
+                    TextView tvTop = new TextView(MainActivity.this);
+                    tvTop.setText("🪑 【" + po.table + "】 單號:" + po.orderId + " ｜ 時間:" + po.time
+                        + " ｜ 預計付款:" + po.paymentPref + " ｜ 應收 $" + po.total);
+                    tvTop.setTextColor(Color.parseColor("#FCD34D"));
+                    tvTop.setTextSize(13);
+                    tvTop.setTypeface(null, Typeface.BOLD);
+                    card.addView(tvTop);
+
+                    StringBuilder itemsSb = new StringBuilder();
+                    for (CloudSyncManager.PendingQrItem pi : po.items) {
+                        itemsSb.append("• ").append(pi.name).append(" x").append(pi.qty);
+                        if (pi.choice != null && !pi.choice.isEmpty()) itemsSb.append(" [").append(pi.choice).append("]");
+                        if (pi.mealDrinkName != null && !pi.mealDrinkName.isEmpty() && !"不需附茶".equals(pi.mealDrinkName)) {
+                            itemsSb.append(" +附飲:").append(pi.mealDrinkName)
+                                   .append("(").append(pi.mealDrinkSweet).append("/").append(pi.mealDrinkIce).append(")");
+                        } else if (pi.sweet != null && !pi.sweet.isEmpty()) {
+                            itemsSb.append(" (").append(pi.sweet).append("/").append(pi.ice).append(")");
+                        }
+                        for (AddonOption ao : pi.addons) {
+                            itemsSb.append(" +").append(ao.name);
+                        }
+                        itemsSb.append("\n");
+                    }
+                    if (po.customerNote != null && !po.customerNote.isEmpty()) {
+                        itemsSb.append("📝 客人備註：").append(po.customerNote).append("\n");
+                    }
+
+                    TextView tvItems = new TextView(MainActivity.this);
+                    tvItems.setText(itemsSb.toString().trim());
+                    tvItems.setTextColor(Color.WHITE);
+                    tvItems.setTextSize(12);
+                    tvItems.setPadding(0, dp(4), 0, dp(6));
+                    card.addView(tvItems);
+
+                    LinearLayout btnRow = new LinearLayout(MainActivity.this);
+                    btnRow.setOrientation(LinearLayout.HORIZONTAL);
+
+                    Button btnLoadToCart = makeMiniTuneBtn("📥 載入至購物車(櫃檯收款)", new View.OnClickListener() {
+                        @Override
+                        public void onClick(View v) {
+                            loadPendingQrOrderIntoCart(po, false);
+                            pendingQrOrders.remove(po);
+                            updateQrOrdersBadge();
+                            CloudSyncManager.ackQrOrderAsync(googleSheetUrl, po.orderId, "ACCEPTED", null);
+                            dialog.dismiss();
+                        }
+                    });
+                    btnLoadToCart.setBackground(roundBg(Color.parseColor("#0284C7"), 0, 0, 6));
+
+                    Button btnDirectPrint = makeMiniTuneBtn("⚡ 直接結帳 & 雙機出單", new View.OnClickListener() {
+                        @Override
+                        public void onClick(View v) {
+                            pendingQrOrders.remove(po);
+                            updateQrOrdersBadge();
+                            CloudSyncManager.ackQrOrderAsync(googleSheetUrl, po.orderId, "ACCEPTED", null);
+                            dialog.dismiss();
+                            loadPendingQrOrderIntoCart(po, true);
+                        }
+                    });
+                    btnDirectPrint.setBackground(roundBg(Color.parseColor("#10B981"), 0, 0, 6));
+                    btnDirectPrint.setTextColor(Color.parseColor("#052E16"));
+
+                    Button btnReject = makeMiniTuneBtn("🗑️ 取消", new View.OnClickListener() {
+                        @Override
+                        public void onClick(View v) {
+                            pendingQrOrders.remove(po);
+                            updateQrOrdersBadge();
+                            CloudSyncManager.ackQrOrderAsync(googleSheetUrl, po.orderId, "CANCELLED", null);
+                            run();
+                        }
+                    });
+                    btnReject.setBackground(roundBg(Color.parseColor("#EF4444"), 0, 0, 6));
+
+                    LinearLayout.LayoutParams lpB1 = new LinearLayout.LayoutParams(0, dp(34), 1.1f);
+                    lpB1.rightMargin = dp(4);
+                    btnRow.addView(btnLoadToCart, lpB1);
+                    btnRow.addView(btnDirectPrint, lpB1);
+                    btnRow.addView(btnReject, new LinearLayout.LayoutParams(dp(64), dp(34)));
+
+                    card.addView(btnRow);
+                    llQueueList.addView(card);
+                }
+            }
+        };
+
+        btnRefreshQr.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                Toast.makeText(MainActivity.this, "⏳ 正在向 Google 試算表查詢最新掃碼訂單...", Toast.LENGTH_SHORT).show();
+                CloudSyncManager.fetchPendingQrOrdersAsync(googleSheetUrl, new CloudSyncManager.QrOrdersCallback() {
+                    @Override
+                    public void onResult(boolean ok, String msg, List<CloudSyncManager.PendingQrOrder> list) {
+                        if (ok && list != null) {
+                            pendingQrOrders.clear();
+                            pendingQrOrders.addAll(list);
+                            updateQrOrdersBadge();
+                            rebuildQrQueueUI.run();
+                        }
+                        Toast.makeText(MainActivity.this, msg, Toast.LENGTH_SHORT).show();
+                    }
+                });
+            }
+        });
+
+        // --- 右欄：各桌專屬 QR Code 產生與 HPRT TP805L 立牌列印 ---
+        LinearLayout rightCol = new LinearLayout(this);
+        rightCol.setOrientation(LinearLayout.VERTICAL);
+        rightCol.setGravity(Gravity.CENTER_HORIZONTAL);
+        rightCol.setBackground(roundBg(Color.parseColor("#1E293B"), Color.parseColor("#334155"), 1, 8));
+        rightCol.setPadding(dp(10), dp(8), dp(10), dp(8));
+
+        TextView tvQrHeader = new TextView(this);
+        tvQrHeader.setText("🖨️ 各桌掃碼點餐 QR Code 產生與印桌牌");
+        tvQrHeader.setTextColor(Color.parseColor("#A7F3D0"));
+        tvQrHeader.setTextSize(14);
+        tvQrHeader.setTypeface(null, Typeface.BOLD);
+        rightCol.addView(tvQrHeader);
+
+        final List<String> qrTargets = new ArrayList<>(getActiveTableNames());
+        qrTargets.add("外帶");
+        qrTargets.add("外送");
+        final String[] selectedQrTable = {currentTable};
+
+        HorizontalScrollView hsvTables = new HorizontalScrollView(this);
+        final LinearLayout llQrTableBtns = new LinearLayout(this);
+        llQrTableBtns.setOrientation(LinearLayout.HORIZONTAL);
+        llQrTableBtns.setPadding(0, dp(6), 0, dp(6));
+        hsvTables.addView(llQrTableBtns);
+        rightCol.addView(hsvTables, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        final android.widget.ImageView ivQrPreview = new android.widget.ImageView(this);
+        ivQrPreview.setAdjustViewBounds(true);
+        LinearLayout.LayoutParams lpQrImg = new LinearLayout.LayoutParams(dp(200), dp(200));
+        lpQrImg.topMargin = dp(4);
+        rightCol.addView(ivQrPreview, lpQrImg);
+
+        final TextView tvQrUrlHint = new TextView(this);
+        tvQrUrlHint.setTextColor(Color.parseColor("#CBD5E1"));
+        tvQrUrlHint.setTextSize(11);
+        tvQrUrlHint.setGravity(Gravity.CENTER);
+        tvQrUrlHint.setPadding(dp(4), dp(4), dp(4), dp(6));
+        rightCol.addView(tvQrUrlHint);
+
+        final Runnable updateQrPreview = new Runnable() {
+            @Override
+            public void run() {
+                llQrTableBtns.removeAllViews();
+                for (final String tbl : qrTargets) {
+                    Button b = makeMiniTuneBtn(tbl, new View.OnClickListener() {
+                        @Override
+                        public void onClick(View v) {
+                            selectedQrTable[0] = tbl;
+                            run();
+                        }
+                    });
+                    boolean act = tbl.equals(selectedQrTable[0]);
+                    b.setBackground(roundBg(
+                        act ? Color.parseColor("#10B981") : Color.parseColor("#334155"), 0, 0, 6));
+                    b.setTextColor(act ? Color.parseColor("#052E16") : Color.WHITE);
+                    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, dp(32));
+                    lp.rightMargin = dp(4);
+                    llQrTableBtns.addView(b, lp);
+                }
+
+                String baseUrl = (googleSheetUrl != null && !googleSheetUrl.trim().isEmpty())
+                    ? googleSheetUrl.trim()
+                    : "https://script.google.com/macros/s/請先設定試算表網址/exec";
+                String fullUrl = buildTableOrderUrl(baseUrl, selectedQrTable[0]);
+                android.graphics.Bitmap qrBmp = QrCodeGenerator.generateQrBitmap(fullUrl, 240);
+                ivQrPreview.setImageBitmap(qrBmp);
+                tvQrUrlHint.setText("目前顯示：【" + selectedQrTable[0] + "】專屬掃碼點餐條碼\n(客人掃描後自動帶入桌號 " + selectedQrTable[0] + ")");
+            }
+        };
+
+        Button btnPrintSingleStandee = new Button(this);
+        btnPrintSingleStandee.setText("🖨️ 用出單機(TP805L)印出本桌掃碼立牌");
+        btnPrintSingleStandee.setAllCaps(false);
+        btnPrintSingleStandee.setTextSize(12);
+        btnPrintSingleStandee.setTypeface(null, Typeface.BOLD);
+        btnPrintSingleStandee.setTextColor(Color.parseColor("#052E16"));
+        btnPrintSingleStandee.setBackground(roundBg(Color.parseColor("#10B981"), 0, 0, 8));
+        btnPrintSingleStandee.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (googleSheetUrl == null || googleSheetUrl.trim().isEmpty()) {
+                    Toast.makeText(MainActivity.this, "請先在設定頁儲存 Google 試算表網址！", Toast.LENGTH_LONG).show();
+                    return;
+                }
+                String url = buildTableOrderUrl(googleSheetUrl.trim(), selectedQrTable[0]);
+                Toast.makeText(MainActivity.this, "⏳ 正在從 HPRT TP805L 印出【" + selectedQrTable[0] + "】掃碼點餐立牌...", Toast.LENGTH_SHORT).show();
+                PosPrintEngine.printTableQrStandeeAsync(
+                    selectedQrTable[0], url, receiptIp, receiptPort,
+                    new PosPrintEngine.PrintCallback() {
+                        @Override
+                        public void onComplete(boolean ok, String msg) {
+                            Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show();
+                        }
+                    });
+            }
+        });
+        rightCol.addView(btnPrintSingleStandee, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
+
+        LinearLayout.LayoutParams lpLeft = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.56f);
+        lpLeft.rightMargin = dp(8);
+        content.addView(leftCol, lpLeft);
+        content.addView(rightCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.44f));
+
+        rebuildQrQueueUI.run();
+        updateQrPreview.run();
+
+        dialog.setContentView(root, new ViewGroup.LayoutParams(dialogW, dialogH));
+        dialog.show();
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+            dialog.getWindow().setLayout(dialogW, dialogH);
+        }
+    }
+
+    private String buildTableOrderUrl(String baseUrl, String tableName) {
+        try {
+            String enc = java.net.URLEncoder.encode(tableName, "UTF-8");
+            return baseUrl + (baseUrl.contains("?") ? "&" : "?") + "page=order&table=" + enc;
+        } catch (Exception e) {
+            return baseUrl + "?page=order&table=" + tableName;
+        }
+    }
+
+    private void loadPendingQrOrderIntoCart(CloudSyncManager.PendingQrOrder po, boolean autoCheckoutAndPrint) {
+        cart.clear();
+        orderDiscount = 0;
+        if ("外帶".equals(po.table) || "外送".equals(po.table)) {
+            currentOrderType = po.table;
+        } else {
+            currentOrderType = "內用";
+            currentTable = po.table;
+        }
+
+        for (CloudSyncManager.PendingQrItem pi : po.items) {
+            MenuItem matched = null;
+            for (MenuItem m : menuItems) {
+                if (m.name.equals(pi.name)) {
+                    matched = m;
+                    break;
+                }
+            }
+            if (matched == null) {
+                matched = new MenuItem(9999, "線上點餐", pi.name, "", pi.unitPrice, false, false, false, false, false, null);
+            }
+            CartItem ci = new CartItem();
+            ci.menu = matched;
+            ci.qty = Math.max(1, pi.qty);
+            ci.selectedChoice = pi.choice != null ? pi.choice : "";
+            ci.drinkSweet = pi.sweet != null ? pi.sweet : "5分半糖";
+            ci.drinkIce = pi.ice != null ? pi.ice : "8分少冰";
+            ci.mealDrinkName = pi.mealDrinkName != null ? pi.mealDrinkName : "毛尖綠茶";
+            ci.mealDrinkDiff = pi.mealDrinkDiff;
+            ci.mealDrinkSweet = pi.mealDrinkSweet != null ? pi.mealDrinkSweet : "無糖";
+            ci.mealDrinkIce = pi.mealDrinkIce != null ? pi.mealDrinkIce : "3分微冰";
+            ci.addons.addAll(pi.addons);
+            ci.note = pi.note != null ? pi.note : "";
+            if (po.customerNote != null && !po.customerNote.isEmpty() && ci.note.isEmpty()) {
+                ci.note = po.customerNote;
+            }
+            ci.printLabel = shouldPrintLabelByDefault(matched.isDrink, currentOrderType);
+            ci.printDrinkLabel = true;
+            cart.add(ci);
+        }
+
+        refreshOrderTypeButtons();
+        refreshCartUI();
+        switchMainTab(0);
+
+        if (autoCheckoutAndPrint) {
+            int due = getCartGrandTotal();
+            OrderRecord rec = new OrderRecord();
+            rec.callNum = formatCallNum(callSequence);
+            rec.time = new SimpleDateFormat("HH:mm", Locale.TAIWAN).format(new Date());
+            rec.orderType = "內用".equals(currentOrderType) ? "內用(" + currentTable + ")" : currentOrderType;
+            for (CartItem ci : cart) rec.items.add(ci);
+            rec.orderDiscount = 0;
+            rec.total = due;
+            rec.paymentMethod = (po.paymentPref != null && !po.paymentPref.isEmpty()) ? po.paymentPref : "現金";
+            rec.cashReceived = due;
+            rec.cashChange = 0;
+            rec.printReceipt = globalPrintReceipt;
+            rec.stickerCount = getTotalStickersCount();
+
+            dbHelper.insertOrder(rec);
+            ordersHistory.add(0, rec);
+            callSequence++;
+            dbHelper.setSetting("call_sequence", String.valueOf(callSequence));
+            tvTopCallNum.setText("取餐號 " + formatCallNum(callSequence));
+            updateOrdersBadge();
+
+            cart.clear();
+            refreshCartUI();
+            showPrintPreviewAndDispatch(rec, true);
+        } else {
+            Toast.makeText(this, "📥 已將【" + po.table + "】掃碼訂單載入購物車，請點右下角結帳出單！", Toast.LENGTH_LONG).show();
+        }
+    }
+
     // ==================== CHECKOUT & PRINT PREVIEW DIALOG ====================
     private void showCheckoutDialog() {
         if (cart.isEmpty()) {
@@ -1847,7 +2783,7 @@ public class MainActivity extends Activity {
             return;
         }
         final int due = getCartGrandTotal();
-        final String[] payMethods = {"現金", "LINE Pay", "街口支付", "UberEats", "Foodpanda"};
+        final String[] payMethods = {"現金", "信用卡", "LINE Pay", "街口支付", "UberEats", "Foodpanda"};
         final String[] selPay = {
             ("UberEats".equals(currentOrderType) || "Foodpanda".equals(currentOrderType)) ? currentOrderType : "現金"
         };
@@ -2014,17 +2950,31 @@ public class MainActivity extends Activity {
             sb.append("========== [GoDEX DT2x 40×30mm 標籤貼紙 (").append(labelIp).append(":").append(labelPort).append(")] ==========\n");
             int cur = 1;
             for (CartItem ci : order.items) {
-                if (!ci.printLabel) continue;
-                for (int k = 0; k < ci.qty; k++) {
-                    sb.append("┌──────────────────────────────┐\n");
-                    sb.append("│ ").append(order.callNum).append(" [").append(order.orderType).append("]          (")
-                      .append(cur).append("/").append(order.stickerCount).append(") │\n");
-                    sb.append("│ ").append(ci.menu.name).append("\n");
-                    sb.append("│ ").append(ci.getModSummary()).append("\n");
-                    sb.append("│ 伊凡的花園 ").append(order.time).append("        $")
-                      .append(ci.getSubTotal() / Math.max(1, ci.qty)).append(" │\n");
-                    sb.append("└──────────────────────────────┘\n");
-                    cur++;
+                if (ci.printLabel) {
+                    for (int k = 0; k < ci.qty; k++) {
+                        sb.append("┌──────────────────────────────┐\n");
+                        sb.append("│ ").append(order.callNum).append(" [").append(order.orderType).append("]          (")
+                          .append(cur).append("/").append(order.stickerCount).append(") │\n");
+                        sb.append("│ ").append(ci.menu.name).append("\n");
+                        sb.append("│ ").append(ci.getModSummary()).append("\n");
+                        sb.append("│ 伊凡的花園 ").append(order.time).append("        $")
+                          .append(ci.getSubTotal() / Math.max(1, ci.qty)).append(" │\n");
+                        sb.append("└──────────────────────────────┘\n");
+                        cur++;
+                    }
+                }
+                if (ci.hasAttachedDrink() && ci.printDrinkLabel) {
+                    for (int k = 0; k < ci.qty; k++) {
+                        sb.append("┌──────────────────────────────┐\n");
+                        sb.append("│ ").append(order.callNum).append(" [").append(order.orderType).append("]          (")
+                          .append(cur).append("/").append(order.stickerCount).append(") │\n");
+                        sb.append("│ [附飲] ").append(ci.mealDrinkName).append("\n");
+                        sb.append("│ ").append(ci.getAttachedDrinkModSummary()).append("\n");
+                        sb.append("│ 伊凡的花園 ").append(order.time).append("        $")
+                          .append(Math.max(0, ci.mealDrinkDiff)).append(" │\n");
+                        sb.append("└──────────────────────────────┘\n");
+                        cur++;
+                    }
                 }
             }
         }
@@ -2234,8 +3184,9 @@ public class MainActivity extends Activity {
             itemCopy.addons.addAll(ci.addons);
             itemCopy.itemDiscount = ci.itemDiscount;
             itemCopy.note = ci.note;
-            itemCopy.printLabel = wantStickers && (ci.printLabel || src.stickerCount == 0);
-            if (itemCopy.printLabel) totalQty += itemCopy.qty;
+            itemCopy.printLabel = wantStickers && (ci.printLabel || (!ci.hasAttachedDrink() && src.stickerCount == 0));
+            itemCopy.printDrinkLabel = wantStickers && ci.hasAttachedDrink();
+            totalQty += itemCopy.getItemStickerCount();
             c.items.add(itemCopy);
         }
         c.stickerCount = wantStickers ? totalQty : 0;

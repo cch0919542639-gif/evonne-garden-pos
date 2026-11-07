@@ -77,28 +77,46 @@ public class PosPrintEngine {
                     }
                 }
 
-                // B. 列印 GoDEX DT2x 40x30mm 貼紙 (自動拆張 1/N)
+                // B. 列印 GoDEX DT2x 40x30mm 貼紙 (支援主品項與隨餐附贈/換購飲料自動拆張 1/N)
                 if (order.stickerCount > 0) {
                     try {
                         ByteArrayOutputStream allLabels = new ByteArrayOutputStream();
                         int cur = 1;
                         for (MainActivity.CartItem ci : order.items) {
-                            if (!ci.printLabel) continue;
-                            int unitActual = Math.max(0, ci.getSubTotal() / Math.max(1, ci.qty));
-                            for (int k = 0; k < ci.qty; k++) {
-                                Bitmap lblBmp = renderLabelBitmap40x30(
-                                    order.callNum, order.orderType, cur, order.stickerCount,
-                                    ci.menu.name, ci.getModSummary(), order.time, unitActual);
-                                byte[] cmd = "TSPL".equalsIgnoreCase(labelProtocol)
-                                    ? encodeTsplLabel40x30(lblBmp)
-                                    : encodeEzplLabel40x30(lblBmp);
-                                allLabels.write(cmd);
-                                cur++;
+                            // 1. 主品項貼紙 (單點飲料 或 外帶/外送餐盒)
+                            if (ci.printLabel) {
+                                int unitActual = Math.max(0, ci.getSubTotal() / Math.max(1, ci.qty));
+                                for (int k = 0; k < ci.qty; k++) {
+                                    Bitmap lblBmp = renderLabelBitmap40x30(
+                                        order.callNum, order.orderType, cur, order.stickerCount,
+                                        ci.menu.name, ci.getModSummary(), order.time, unitActual);
+                                    byte[] cmd = "TSPL".equalsIgnoreCase(labelProtocol)
+                                        ? encodeTsplLabel40x30(lblBmp)
+                                        : encodeEzplLabel40x30(lblBmp);
+                                    allLabels.write(cmd);
+                                    cur++;
+                                }
+                            }
+                            // 2. 主餐隨餐附贈 / 補差價換購之飲料專屬貼紙 (內用、外帶、外送皆自動印飲料杯貼紙)
+                            if (ci.hasAttachedDrink() && ci.printDrinkLabel) {
+                                String drinkTitle = "[附飲] " + ci.mealDrinkName;
+                                String drinkMods = ci.getAttachedDrinkModSummary();
+                                int drinkDiff = Math.max(0, ci.mealDrinkDiff);
+                                for (int k = 0; k < ci.qty; k++) {
+                                    Bitmap drinkBmp = renderLabelBitmap40x30(
+                                        order.callNum, order.orderType, cur, order.stickerCount,
+                                        drinkTitle, drinkMods, order.time, drinkDiff);
+                                    byte[] cmd = "TSPL".equalsIgnoreCase(labelProtocol)
+                                        ? encodeTsplLabel40x30(drinkBmp)
+                                        : encodeEzplLabel40x30(drinkBmp);
+                                    allLabels.write(cmd);
+                                    cur++;
+                                }
                             }
                         }
                         if (allLabels.size() > 0) {
                             sendTcpWithRetry(labelIp, labelPort, allLabels.toByteArray());
-                            logs.add("🏷️ 貼紙機(" + labelIp + ")：已印 " + order.stickerCount + " 張");
+                            logs.add("🏷️ 貼紙機(" + labelIp + ")：已印 " + (cur - 1) + " 張");
                         }
                     } catch (Exception e) {
                         ok = false;
@@ -199,6 +217,25 @@ public class PosPrintEngine {
                     postResult(callback, true, "✅ GoDEX DT2x (" + ip + ":" + port + ") 測試貼紙列印成功！");
                 } catch (Exception e) {
                     postResult(callback, false, "❌ GoDEX DT2x (" + ip + ":" + port + ") 連線失敗：" + e.getMessage());
+                }
+            }
+        });
+    }
+
+    public static void printTableQrStandeeAsync(final String tableName, final String orderUrl,
+                                                final String receiptIp, final int receiptPort,
+                                                final PrintCallback callback) {
+        EXECUTOR.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Bitmap bmp = QrCodeGenerator.renderTableQrStandeeBitmap(
+                        tableName, orderUrl, receiptPrintableDots);
+                    byte[] payload = encodeEscPosRasterReceipt(bmp, true);
+                    sendTcpWithRetry(receiptIp, receiptPort, payload);
+                    postResult(callback, true, "✅ 已從 HPRT TP805L 印出【" + tableName + "】掃碼點餐立牌！");
+                } catch (Exception e) {
+                    postResult(callback, false, "❌ 列印桌牌失敗 (" + receiptIp + ")：" + e.getMessage());
                 }
             }
         });
@@ -521,15 +558,16 @@ public class PosPrintEngine {
     }
 
     /**
-     * 封裝為 GoDEX DT2x 原生 EZPL 指令 (^Q30,3 / ^W40 / ^L / Qv,0,0,40,240,<raw_bitmap> / E)
+     * 封裝為 GoDEX DT2x 原生 EZPL 指令 (^Q30,3 / ^W40 / ^L / Q0,0,40,240<CR><LF><raw_bitmap> / E)
+     * 修正：GoDEX EZPL Pattern 標準語法為 Qx,y,width_bytes,height_dots (不含 v,)，避免印出空白標籤。
      */
     public static byte[] encodeEzplLabel40x30(Bitmap bmp) throws Exception {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         int widthBytes = 40; // 320 / 8 = 40 bytes
         int height = 240;
 
-        String header = "^Q30,3\r\n^W40\r\n^H10\r\n^P1\r\n^S3\r\n^L\r\n"
-            + "Qv,0,0," + widthBytes + "," + height + "\r\n";
+        String header = "^Q30,3\r\n^W40\r\n^H12\r\n^P1\r\n^S3\r\n^L\r\n"
+            + "Q0,0," + widthBytes + "," + height + "\r\n";
         out.write(header.getBytes(StandardCharsets.US_ASCII));
 
         for (int y = 0; y < height; y++) {
@@ -540,7 +578,7 @@ public class PosPrintEngine {
                     int pixel = bmp.getPixel(x, y);
                     int lum = (Color.red(pixel) + Color.green(pixel) + Color.blue(pixel)) / 3;
                     if (lum < 150) {
-                        b |= (1 << (7 - bit)); // EZPL Qv: 1 = 黑點
+                        b |= (1 << (7 - bit)); // EZPL Q: 1 = 黑點, 0 = 白點
                     }
                 }
                 out.write(b);
