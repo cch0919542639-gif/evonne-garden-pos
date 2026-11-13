@@ -28,7 +28,7 @@ import java.util.Map;
 public class PosDatabaseHelper extends SQLiteOpenHelper {
 
     private static final String DB_NAME = "evonne_garden_pos.db";
-    private static final int DB_VERSION = 1;
+    private static final int DB_VERSION = 2;
     private final Context appContext;
 
     public PosDatabaseHelper(Context context) {
@@ -73,7 +73,8 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
             + "sticker_count INTEGER NOT NULL DEFAULT 0, "
             + "voided INTEGER NOT NULL DEFAULT 0, "
             + "closed INTEGER NOT NULL DEFAULT 0, "
-            + "synced INTEGER NOT NULL DEFAULT 0)");
+            + "synced INTEGER NOT NULL DEFAULT 0, "
+            + "staff_name TEXT NOT NULL DEFAULT '')");
 
         db.execSQL("CREATE TABLE IF NOT EXISTS daily_closings ("
             + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -89,11 +90,62 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
             + "csv_path TEXT NOT NULL DEFAULT '', "
             + "cloud_synced INTEGER NOT NULL DEFAULT 0, "
             + "cloud_status TEXT NOT NULL DEFAULT '')");
+
+        db.execSQL("CREATE TABLE IF NOT EXISTS staff_members ("
+            + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            + "name TEXT NOT NULL, "
+            + "role TEXT NOT NULL DEFAULT '店員', "
+            + "pin TEXT NOT NULL DEFAULT '', "
+            + "enabled INTEGER NOT NULL DEFAULT 1)");
+
+        db.execSQL("CREATE TABLE IF NOT EXISTS shift_handovers ("
+            + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            + "shift_start TEXT NOT NULL, "
+            + "shift_end TEXT NOT NULL, "
+            + "staff_name TEXT NOT NULL, "
+            + "opening_cash INTEGER NOT NULL DEFAULT 0, "
+            + "cash_sales INTEGER NOT NULL DEFAULT 0, "
+            + "non_cash_sales INTEGER NOT NULL DEFAULT 0, "
+            + "expected_cash INTEGER NOT NULL DEFAULT 0, "
+            + "counted_cash INTEGER NOT NULL DEFAULT 0, "
+            + "diff_cash INTEGER NOT NULL DEFAULT 0, "
+            + "order_count INTEGER NOT NULL DEFAULT 0, "
+            + "void_count INTEGER NOT NULL DEFAULT 0, "
+            + "note TEXT NOT NULL DEFAULT '')");
+
+        db.execSQL("CREATE TABLE IF NOT EXISTS audit_logs ("
+            + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            + "created_at TEXT NOT NULL, "
+            + "staff_name TEXT NOT NULL, "
+            + "action_type TEXT NOT NULL, "
+            + "target_ref TEXT NOT NULL DEFAULT '', "
+            + "detail TEXT NOT NULL DEFAULT '')");
     }
 
     @Override
     public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
         onCreate(db);
+        if (oldVersion < 2) {
+            try {
+                db.execSQL("ALTER TABLE orders ADD COLUMN staff_name TEXT NOT NULL DEFAULT ''");
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public boolean hasAnyMenuOrHistory() {
+        SQLiteDatabase db = getReadableDatabase();
+        String[] tables = {"menu_items", "orders", "daily_closings"};
+        for (String tbl : tables) {
+            Cursor c = null;
+            try {
+                c = db.rawQuery("SELECT COUNT(*) FROM " + tbl, null);
+                if (c.moveToFirst() && c.getInt(0) > 0) return true;
+            } catch (Exception ignored) {
+            } finally {
+                if (c != null) c.close();
+            }
+        }
+        return false;
     }
 
     // ==================== 參數化設定存取 ====================
@@ -245,6 +297,7 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
         cv.put("voided", rec.voided ? 1 : 0);
         cv.put("closed", 0);
         cv.put("synced", 0);
+        cv.put("staff_name", rec.staffName != null ? rec.staffName : "");
         long rowId = db.insert("orders", null, cv);
         rec.dbId = rowId;
         return rowId;
@@ -264,7 +317,7 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
         try {
             c = db.rawQuery("SELECT id, call_num, order_time, order_type, items_json, "
                 + "order_discount, total, payment_method, cash_received, cash_change, "
-                + "print_receipt, sticker_count, voided FROM orders WHERE closed = 0 ORDER BY id DESC", null);
+                + "print_receipt, sticker_count, voided, staff_name FROM orders WHERE closed = 0 ORDER BY id DESC", null);
             while (c.moveToNext()) {
                 MainActivity.OrderRecord r = new MainActivity.OrderRecord();
                 r.dbId = c.getLong(0);
@@ -280,6 +333,7 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
                 r.printReceipt = c.getInt(10) == 1;
                 r.stickerCount = c.getInt(11);
                 r.voided = c.getInt(12) == 1;
+                r.staffName = c.getString(13);
                 res.add(r);
             }
         } catch (Exception ignored) {
@@ -474,7 +528,9 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
                                      Map<String, Integer> byPay,
                                      Map<String, Integer> itemRank) {
         String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.TAIWAN).format(new Date());
-        String fileName = "EvonnePOS_Closing_" + stamp + ".csv";
+        String codePrefix = (PosPrintEngine.storeCode != null && !PosPrintEngine.storeCode.trim().isEmpty())
+            ? PosPrintEngine.storeCode.trim().replaceAll("[^a-zA-Z0-9_-]", "_") : "POS";
+        String fileName = codePrefix + "_Closing_" + stamp + ".csv";
 
         File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "POS_Reports");
         if (!dir.exists() && !dir.mkdirs()) {
@@ -504,7 +560,9 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
             fos.write(new byte[]{(byte) 0xEF, (byte) 0xBB, (byte) 0xBF});
             writer = new OutputStreamWriter(fos, StandardCharsets.UTF_8);
 
-            writer.write("伊凡的花園 Evonne's Garden - 每日關帳日結報表\r\n");
+            String reportStoreName = (PosPrintEngine.storeName != null && !PosPrintEngine.storeName.trim().isEmpty())
+                ? PosPrintEngine.storeName.trim() : "智慧餐飲 POS";
+            writer.write(reportStoreName + " - 每日關帳日結報表\r\n");
             writer.write("關帳時間," + csvEscape(cr.time) + "\r\n");
             writer.write("有效訂單數," + cr.validCount + "\r\n");
             writer.write("作廢退單數," + cr.voidCount + "\r\n");
@@ -555,14 +613,186 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
         return clean;
     }
 
-    // ==================== 完整系統快照備份 & 雲端一鍵回復 & 斷網補傳佇列 ====================
+    // ==================== 員工、交班盤點與稽核日誌 CRUD ====================
+    public void seedDefaultStaffIfEmpty(String managerPin) {
+        SQLiteDatabase db = getWritableDatabase();
+        Cursor c = null;
+        int cnt = 0;
+        try {
+            c = db.rawQuery("SELECT COUNT(*) FROM staff_members", null);
+            if (c.moveToFirst()) cnt = c.getInt(0);
+        } catch (Exception ignored) {
+        } finally {
+            if (c != null) c.close();
+        }
+        if (cnt > 0) return;
+
+        MainActivity.StaffMember mgr = new MainActivity.StaffMember();
+        mgr.name = "店長";
+        mgr.role = "店長";
+        mgr.pin = managerPin != null ? managerPin : "";
+        mgr.enabled = true;
+        upsertStaffMember(mgr);
+
+        MainActivity.StaffMember cashier = new MainActivity.StaffMember();
+        cashier.name = "早班店員";
+        cashier.role = "店員";
+        cashier.pin = "";
+        cashier.enabled = true;
+        upsertStaffMember(cashier);
+    }
+
+    public List<MainActivity.StaffMember> loadStaffMembers() {
+        List<MainActivity.StaffMember> list = new ArrayList<>();
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = null;
+        try {
+            c = db.rawQuery("SELECT id, name, role, pin, enabled FROM staff_members WHERE enabled = 1 ORDER BY id ASC", null);
+            while (c.moveToNext()) {
+                MainActivity.StaffMember s = new MainActivity.StaffMember();
+                s.id = c.getLong(0);
+                s.name = c.getString(1);
+                s.role = c.getString(2);
+                s.pin = c.getString(3);
+                s.enabled = c.getInt(4) == 1;
+                list.add(s);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (c != null) c.close();
+        }
+        return list;
+    }
+
+    public long upsertStaffMember(MainActivity.StaffMember s) {
+        SQLiteDatabase db = getWritableDatabase();
+        ContentValues cv = new ContentValues();
+        cv.put("name", s.name != null ? s.name.trim() : "店員");
+        cv.put("role", s.role != null ? s.role : "店員");
+        cv.put("pin", s.pin != null ? s.pin.trim() : "");
+        cv.put("enabled", s.enabled ? 1 : 0);
+        if (s.id > 0) {
+            db.update("staff_members", cv, "id = ?", new String[]{String.valueOf(s.id)});
+            return s.id;
+        } else {
+            s.id = db.insert("staff_members", null, cv);
+            return s.id;
+        }
+    }
+
+    public void deleteStaffMember(long id) {
+        SQLiteDatabase db = getWritableDatabase();
+        db.delete("staff_members", "id = ?", new String[]{String.valueOf(id)});
+    }
+
+    public long insertShiftHandover(MainActivity.ShiftHandoverRecord sh) {
+        SQLiteDatabase db = getWritableDatabase();
+        ContentValues cv = new ContentValues();
+        cv.put("shift_start", sh.shiftStart != null ? sh.shiftStart : "");
+        cv.put("shift_end", sh.shiftEnd != null ? sh.shiftEnd : "");
+        cv.put("staff_name", sh.staffName != null ? sh.staffName : "");
+        cv.put("opening_cash", sh.openingCash);
+        cv.put("cash_sales", sh.cashSales);
+        cv.put("non_cash_sales", sh.nonCashSales);
+        cv.put("expected_cash", sh.expectedCash);
+        cv.put("counted_cash", sh.countedCash);
+        cv.put("diff_cash", sh.diffCash);
+        cv.put("order_count", sh.orderCount);
+        cv.put("void_count", sh.voidCount);
+        cv.put("note", sh.note != null ? sh.note : "");
+        sh.id = db.insert("shift_handovers", null, cv);
+        return sh.id;
+    }
+
+    public List<MainActivity.ShiftHandoverRecord> loadShiftHandovers(int limit) {
+        List<MainActivity.ShiftHandoverRecord> list = new ArrayList<>();
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = null;
+        try {
+            c = db.rawQuery("SELECT id, shift_start, shift_end, staff_name, opening_cash, cash_sales, "
+                + "non_cash_sales, expected_cash, counted_cash, diff_cash, order_count, void_count, note "
+                + "FROM shift_handovers ORDER BY id DESC LIMIT ?", new String[]{String.valueOf(limit)});
+            while (c.moveToNext()) {
+                MainActivity.ShiftHandoverRecord sh = new MainActivity.ShiftHandoverRecord();
+                sh.id = c.getLong(0);
+                sh.shiftStart = c.getString(1);
+                sh.shiftEnd = c.getString(2);
+                sh.staffName = c.getString(3);
+                sh.openingCash = c.getInt(4);
+                sh.cashSales = c.getInt(5);
+                sh.nonCashSales = c.getInt(6);
+                sh.expectedCash = c.getInt(7);
+                sh.countedCash = c.getInt(8);
+                sh.diffCash = c.getInt(9);
+                sh.orderCount = c.getInt(10);
+                sh.voidCount = c.getInt(11);
+                sh.note = c.getString(12);
+                list.add(sh);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (c != null) c.close();
+        }
+        return list;
+    }
+
+    public void insertAuditLog(String staffName, String actionType, String targetRef, String detail) {
+        SQLiteDatabase db = getWritableDatabase();
+        ContentValues cv = new ContentValues();
+        cv.put("created_at", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.TAIWAN).format(new Date()));
+        cv.put("staff_name", staffName != null ? staffName : "");
+        cv.put("action_type", actionType != null ? actionType : "");
+        cv.put("target_ref", targetRef != null ? targetRef : "");
+        cv.put("detail", detail != null ? detail : "");
+        db.insert("audit_logs", null, cv);
+    }
+
+    public List<MainActivity.AuditLogRecord> loadAuditLogs(int limit) {
+        List<MainActivity.AuditLogRecord> list = new ArrayList<>();
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = null;
+        try {
+            c = db.rawQuery("SELECT id, created_at, staff_name, action_type, target_ref, detail "
+                + "FROM audit_logs ORDER BY id DESC LIMIT ?", new String[]{String.valueOf(limit)});
+            while (c.moveToNext()) {
+                MainActivity.AuditLogRecord a = new MainActivity.AuditLogRecord();
+                a.id = c.getLong(0);
+                a.createdAt = c.getString(1);
+                a.staffName = c.getString(2);
+                a.actionType = c.getString(3);
+                a.targetRef = c.getString(4);
+                a.detail = c.getString(5);
+                list.add(a);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (c != null) c.close();
+        }
+        return list;
+    }
+
+    // ==================== 完整系統快照備份 (Schema v2 標準化，支援無痛跨機與升級SaaS轉移) ====================
     public JSONObject exportFullSnapshotJson(List<MainActivity.MenuItem> menu,
                                              List<MainActivity.ClosingRecord> closings) {
         JSONObject root = new JSONObject();
         try {
-            root.put("backupVersion", 1);
-            root.put("storeName", "伊凡的花園 Evonne's Garden");
+            root.put("schemaVersion", 2);
+            root.put("backupVersion", 2);
+            root.put("storeCode", PosPrintEngine.storeCode);
+            root.put("storeName", PosPrintEngine.storeName);
+            root.put("storeShortName", PosPrintEngine.getEffectiveShortName());
+            root.put("storeSubtitle", PosPrintEngine.storeSubtitle);
             root.put("exportedAt", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.TAIWAN).format(new Date()));
+
+            JSONObject profile = new JSONObject();
+            profile.put("storeCode", PosPrintEngine.storeCode);
+            profile.put("storeName", PosPrintEngine.storeName);
+            profile.put("storeShortName", PosPrintEngine.getEffectiveShortName());
+            profile.put("storeSubtitle", PosPrintEngine.storeSubtitle);
+            profile.put("storeReceiptFooter", PosPrintEngine.storeReceiptFooter);
+            profile.put("planType", getSetting("plan_type", "standard_pos"));
+            profile.put("enabledFeatures", getSetting("enabled_features", "core,qr,drive_backup,ota"));
+            root.put("storeProfile", profile);
 
             JSONObject settingsObj = new JSONObject();
             SQLiteDatabase db = getReadableDatabase();
@@ -623,6 +853,70 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
                 }
             }
             root.put("closings", closeArr);
+
+            JSONArray staffArr = new JSONArray();
+            for (MainActivity.StaffMember s : loadStaffMembers()) {
+                JSONObject so = new JSONObject();
+                so.put("name", s.name);
+                so.put("role", s.role);
+                so.put("pin", s.pin);
+                so.put("enabled", s.enabled);
+                staffArr.put(so);
+            }
+            root.put("staffMembers", staffArr);
+
+            JSONArray shiftArr = new JSONArray();
+            for (MainActivity.ShiftHandoverRecord sh : loadShiftHandovers(180)) {
+                JSONObject sho = new JSONObject();
+                sho.put("shiftStart", sh.shiftStart);
+                sho.put("shiftEnd", sh.shiftEnd);
+                sho.put("staffName", sh.staffName);
+                sho.put("openingCash", sh.openingCash);
+                sho.put("cashSales", sh.cashSales);
+                sho.put("nonCashSales", sh.nonCashSales);
+                sho.put("expectedCash", sh.expectedCash);
+                sho.put("countedCash", sh.countedCash);
+                sho.put("diffCash", sh.diffCash);
+                sho.put("orderCount", sh.orderCount);
+                sho.put("voidCount", sh.voidCount);
+                sho.put("note", sh.note);
+                shiftArr.put(sho);
+            }
+            root.put("shiftHandovers", shiftArr);
+
+            JSONArray auditArr = new JSONArray();
+            for (MainActivity.AuditLogRecord al : loadAuditLogs(300)) {
+                JSONObject ao = new JSONObject();
+                ao.put("createdAt", al.createdAt);
+                ao.put("staffName", al.staffName);
+                ao.put("actionType", al.actionType);
+                ao.put("targetRef", al.targetRef);
+                ao.put("detail", al.detail);
+                auditArr.put(ao);
+            }
+            root.put("auditLogs", auditArr);
+
+            JSONArray activeOrdArr = new JSONArray();
+            List<MainActivity.OrderRecord> activeOrders = loadActiveOrders(menu);
+            for (int i = activeOrders.size() - 1; i >= 0; i--) {
+                MainActivity.OrderRecord o = activeOrders.get(i);
+                JSONObject oo = new JSONObject();
+                oo.put("callNum", o.callNum);
+                oo.put("time", o.time);
+                oo.put("orderType", o.orderType);
+                oo.put("itemsJson", serializeCartItems(o.items));
+                oo.put("orderDiscount", o.orderDiscount);
+                oo.put("total", o.total);
+                oo.put("paymentMethod", o.paymentMethod);
+                oo.put("cashReceived", o.cashReceived);
+                oo.put("cashChange", o.cashChange);
+                oo.put("printReceipt", o.printReceipt);
+                oo.put("stickerCount", o.stickerCount);
+                oo.put("voided", o.voided);
+                oo.put("staffName", o.staffName != null ? o.staffName : "");
+                activeOrdArr.put(oo);
+            }
+            root.put("activeOrders", activeOrdArr);
         } catch (Exception ignored) {}
         return root;
     }
@@ -630,7 +924,7 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
     public String restoreFromSnapshotJson(JSONObject snap) throws Exception {
         if (snap == null) throw new IllegalArgumentException("雲端備份資料為空");
         SQLiteDatabase db = getWritableDatabase();
-        int restoredSettings = 0, restoredMenu = 0, restoredClosings = 0;
+        int restoredSettings = 0, restoredMenu = 0, restoredClosings = 0, restoredStaff = 0, restoredOrders = 0;
         db.beginTransaction();
         try {
             JSONObject settingsObj = snap.optJSONObject("settings");
@@ -648,8 +942,22 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
                 }
             }
 
+            // 相容處理 storeProfile (Schema v2) 或 v1 storeName
+            JSONObject profile = snap.optJSONObject("storeProfile");
+            if (profile != null) {
+                putSettingDirect(db, "store_code", profile.optString("storeCode", "STORE-001"));
+                putSettingDirect(db, "store_name", profile.optString("storeName", "我的餐飲門市"));
+                putSettingDirect(db, "store_short_name", profile.optString("storeShortName", "我的門市"));
+                putSettingDirect(db, "store_subtitle", profile.optString("storeSubtitle", ""));
+                putSettingDirect(db, "store_receipt_footer", profile.optString("storeReceiptFooter", ""));
+                putSettingDirect(db, "store_initialized", "1");
+            } else if (snap.has("storeName")) {
+                putSettingDirect(db, "store_name", snap.optString("storeName", "我的餐飲門市"));
+                putSettingDirect(db, "store_initialized", "1");
+            }
+
             JSONArray menuArr = snap.optJSONArray("menu");
-            if (menuArr != null && menuArr.length() > 0) {
+            if (menuArr != null) {
                 db.delete("menu_items", null, null);
                 for (int i = 0; i < menuArr.length(); i++) {
                     JSONObject o = menuArr.getJSONObject(i);
@@ -691,16 +999,177 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
                     cv.put("printed_paper", co.optBoolean("printedPaper", false) ? 1 : 0);
                     cv.put("csv_path", "");
                     cv.put("cloud_synced", co.optBoolean("cloudSynced", true) ? 1 : 0);
-                    cv.put("cloud_status", co.optString("cloudStatus", "✅ 已由雲端備份還原"));
+                    cv.put("cloud_status", co.optString("cloudStatus", "✅ 已由備份還原"));
                     db.insert("daily_closings", null, cv);
                     restoredClosings++;
                 }
             }
+
+            JSONArray staffArr = snap.optJSONArray("staffMembers");
+            if (staffArr != null && staffArr.length() > 0) {
+                db.delete("staff_members", null, null);
+                for (int i = 0; i < staffArr.length(); i++) {
+                    JSONObject so = staffArr.getJSONObject(i);
+                    ContentValues cv = new ContentValues();
+                    cv.put("name", so.optString("name", "店員"));
+                    cv.put("role", so.optString("role", "店員"));
+                    cv.put("pin", so.optString("pin", ""));
+                    cv.put("enabled", so.optBoolean("enabled", true) ? 1 : 0);
+                    db.insert("staff_members", null, cv);
+                    restoredStaff++;
+                }
+            }
+
+            JSONArray shiftArr = snap.optJSONArray("shiftHandovers");
+            if (shiftArr != null && shiftArr.length() > 0) {
+                db.delete("shift_handovers", null, null);
+                for (int i = shiftArr.length() - 1; i >= 0; i--) {
+                    JSONObject sho = shiftArr.getJSONObject(i);
+                    ContentValues cv = new ContentValues();
+                    cv.put("shift_start", sho.optString("shiftStart", ""));
+                    cv.put("shift_end", sho.optString("shiftEnd", ""));
+                    cv.put("staff_name", sho.optString("staffName", ""));
+                    cv.put("opening_cash", sho.optInt("openingCash", 0));
+                    cv.put("cash_sales", sho.optInt("cashSales", 0));
+                    cv.put("non_cash_sales", sho.optInt("nonCashSales", 0));
+                    cv.put("expected_cash", sho.optInt("expectedCash", 0));
+                    cv.put("counted_cash", sho.optInt("countedCash", 0));
+                    cv.put("diff_cash", sho.optInt("diffCash", 0));
+                    cv.put("order_count", sho.optInt("orderCount", 0));
+                    cv.put("void_count", sho.optInt("voidCount", 0));
+                    cv.put("note", sho.optString("note", ""));
+                    db.insert("shift_handovers", null, cv);
+                }
+            }
+
+            JSONArray auditArr = snap.optJSONArray("auditLogs");
+            if (auditArr != null && auditArr.length() > 0) {
+                db.delete("audit_logs", null, null);
+                for (int i = auditArr.length() - 1; i >= 0; i--) {
+                    JSONObject ao = auditArr.getJSONObject(i);
+                    ContentValues cv = new ContentValues();
+                    cv.put("created_at", ao.optString("createdAt", ""));
+                    cv.put("staff_name", ao.optString("staffName", ""));
+                    cv.put("action_type", ao.optString("actionType", ""));
+                    cv.put("target_ref", ao.optString("targetRef", ""));
+                    cv.put("detail", ao.optString("detail", ""));
+                    db.insert("audit_logs", null, cv);
+                }
+            }
+
+            JSONArray activeOrdArr = snap.optJSONArray("activeOrders");
+            if (activeOrdArr != null && activeOrdArr.length() > 0) {
+                db.delete("orders", "closed = ?", new String[]{"0"});
+                String today = new SimpleDateFormat("yyyy-MM-dd", Locale.TAIWAN).format(new Date());
+                for (int i = 0; i < activeOrdArr.length(); i++) {
+                    JSONObject oo = activeOrdArr.getJSONObject(i);
+                    ContentValues cv = new ContentValues();
+                    cv.put("call_num", oo.optString("callNum", "#001"));
+                    cv.put("order_date", today);
+                    cv.put("order_time", oo.optString("time", ""));
+                    cv.put("order_type", oo.optString("orderType", "內用"));
+                    cv.put("items_json", oo.optString("itemsJson", "[]"));
+                    cv.put("items_summary", "");
+                    cv.put("order_discount", oo.optInt("orderDiscount", 0));
+                    cv.put("total", oo.optInt("total", 0));
+                    cv.put("payment_method", oo.optString("paymentMethod", "現金"));
+                    cv.put("cash_received", oo.optInt("cashReceived", 0));
+                    cv.put("cash_change", oo.optInt("cashChange", 0));
+                    cv.put("print_receipt", oo.optBoolean("printReceipt", true) ? 1 : 0);
+                    cv.put("sticker_count", oo.optInt("stickerCount", 0));
+                    cv.put("voided", oo.optBoolean("voided", false) ? 1 : 0);
+                    cv.put("closed", 0);
+                    cv.put("synced", 0);
+                    cv.put("staff_name", oo.optString("staffName", ""));
+                    db.insert("orders", null, cv);
+                    restoredOrders++;
+                }
+            }
+
             db.setTransactionSuccessful();
         } finally {
             db.endTransaction();
         }
-        return "設定 " + restoredSettings + " 項｜菜單 " + restoredMenu + " 道｜關帳歷史 " + restoredClosings + " 筆";
+        return "設定 " + restoredSettings + " 項｜菜單 " + restoredMenu + " 道｜關帳 " + restoredClosings
+            + " 筆" + (restoredStaff > 0 ? "｜員工 " + restoredStaff + " 位" : "")
+            + (restoredOrders > 0 ? "｜未關帳單 " + restoredOrders + " 筆" : "");
+    }
+
+    private void putSettingDirect(SQLiteDatabase db, String key, String value) {
+        ContentValues cv = new ContentValues();
+        cv.put("setting_key", key);
+        cv.put("setting_value", value != null ? value : "");
+        db.insertWithOnConflict("app_settings", null, cv, SQLiteDatabase.CONFLICT_REPLACE);
+    }
+
+    public String exportSnapshotToLocalFile(JSONObject snap) {
+        String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.TAIWAN).format(new Date());
+        String codePrefix = (PosPrintEngine.storeCode != null && !PosPrintEngine.storeCode.trim().isEmpty())
+            ? PosPrintEngine.storeCode.trim().replaceAll("[^a-zA-Z0-9_-]", "_") : "POS";
+        String fileName = codePrefix + "_Snapshot_" + stamp + ".json";
+        File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "POS_Reports");
+        if (!dir.exists() && !dir.mkdirs()) {
+            dir = new File(appContext.getExternalFilesDir(null), "POS_Reports");
+            if (!dir.exists()) dir.mkdirs();
+        }
+        File outFile = new File(dir, fileName);
+        if (!writeTextFile(outFile, snap.toString())) {
+            File fallbackDir = new File(appContext.getExternalFilesDir(null), "POS_Reports");
+            if (!fallbackDir.exists()) fallbackDir.mkdirs();
+            outFile = new File(fallbackDir, fileName);
+            writeTextFile(outFile, snap.toString());
+        }
+        return outFile.getAbsolutePath();
+    }
+
+    private boolean writeTextFile(File file, String text) {
+        try (FileOutputStream fos = new FileOutputStream(file);
+             OutputStreamWriter w = new OutputStreamWriter(fos, StandardCharsets.UTF_8)) {
+            w.write(text);
+            w.flush();
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public List<File> listLocalSnapshotFiles() {
+        List<File> res = new ArrayList<>();
+        File[] dirs = {
+            new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "POS_Reports"),
+            new File(appContext.getExternalFilesDir(null), "POS_Reports")
+        };
+        for (File d : dirs) {
+            if (d != null && d.exists() && d.isDirectory()) {
+                File[] files = d.listFiles();
+                if (files != null) {
+                    for (File f : files) {
+                        if (f.isFile() && f.getName().toLowerCase(Locale.US).endsWith(".json")) {
+                            res.add(f);
+                        }
+                    }
+                }
+            }
+        }
+        java.util.Collections.sort(res, new java.util.Comparator<File>() {
+            @Override public int compare(File a, File b) {
+                return Long.compare(b.lastModified(), a.lastModified());
+            }
+        });
+        return res;
+    }
+
+    public JSONObject readSnapshotFromFile(File f) throws Exception {
+        byte[] bytes = new byte[(int) f.length()];
+        try (java.io.FileInputStream fis = new java.io.FileInputStream(f)) {
+            int read = 0;
+            while (read < bytes.length) {
+                int r = fis.read(bytes, read, bytes.length - read);
+                if (r < 0) break;
+                read += r;
+            }
+        }
+        return new JSONObject(new String(bytes, StandardCharsets.UTF_8));
     }
 
     public synchronized void enqueuePendingSync(String jsonPayload) {

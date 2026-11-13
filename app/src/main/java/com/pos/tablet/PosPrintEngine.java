@@ -68,6 +68,25 @@ public class PosPrintEngine {
         return sb.toString();
     }
 
+    // ==================== 白牌門市品牌設定 (由 SQLite app_settings 動態載入) ====================
+    public static volatile String storeCode = "STORE-001";
+    public static volatile String storeName = "我的餐飲門市";
+    public static volatile String storeShortName = "我的門市";
+    public static volatile String storeSubtitle = "";
+    public static volatile String storeReceiptFooter = "";
+
+    public static String getEffectiveShortName() {
+        if (storeShortName != null && !storeShortName.trim().isEmpty()) return storeShortName.trim();
+        if (storeName != null && !storeName.trim().isEmpty()) return storeName.trim();
+        return "智慧餐飲";
+    }
+
+    public static String getBackupFolderName() {
+        String base = getEffectiveShortName().replaceAll("[\\\\/:*?\"<>|\\s]+", "_");
+        if (base.isEmpty()) base = "POS門市";
+        return base + "_POS營業備份";
+    }
+
     // ==================== 可動態調整之出單機與貼紙機版面參數 ====================
     // 出單機字體縮放百分比：100(標準), 125(適中), 145(加大-預設), 165(特大), 185(超大), 210(巨字)
     public static volatile int receiptFontScalePercent = 145;
@@ -188,6 +207,25 @@ public class PosPrintEngine {
                     postResult(callback, true, "🧾 HPRT TP805L 日結報表列印成功！");
                 } catch (Exception e) {
                     postResult(callback, false, "⚠️ 日結單列印失敗 (" + receiptIp + ")：" + e.getMessage());
+                }
+            }
+        });
+    }
+
+    public static void printShiftHandoverAsync(final MainActivity.ShiftHandoverRecord sh,
+                                               final String receiptIp, final int receiptPort,
+                                               final int receiptWidthMm,
+                                               final PrintCallback callback) {
+        EXECUTOR.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Bitmap bmp = renderShiftHandoverBitmap(sh, receiptWidthMm);
+                    byte[] payload = encodeEscPosRasterReceipt(bmp, true);
+                    sendTcpWithRetry(receiptIp, receiptPort, payload);
+                    postResult(callback, true, "🤝 HPRT TP805L 交班對帳單列印成功！");
+                } catch (Exception e) {
+                    postResult(callback, false, "⚠️ 交班單列印失敗 (" + receiptIp + ")：" + e.getMessage());
                 }
             }
         });
@@ -346,12 +384,16 @@ public class PosPrintEngine {
         TextPaint tpMod = makeBoldPaint(23f * widthFactor * scale);
         TextPaint tpTotal = makeBoldPaint(32f * widthFactor * scale);
 
-        // 1. 標題區
-        StaticLayout slStore = buildLayout("伊凡的花園 Evonne's Garden", tpStore, innerW, Layout.Alignment.ALIGN_CENTER);
-        StaticLayout slAddr = buildLayout("高雄市三民區龍江街120號｜0982-708-572", tpSub, innerW, Layout.Alignment.ALIGN_CENTER);
+        // 1. 標題區 (動態門市品牌資訊)
+        String headerTitle = (storeName != null && !storeName.trim().isEmpty()) ? storeName.trim() : "智慧餐飲 POS";
+        StaticLayout slStore = buildLayout(headerTitle, tpStore, innerW, Layout.Alignment.ALIGN_CENTER);
+        StaticLayout slAddr = (storeSubtitle != null && !storeSubtitle.trim().isEmpty())
+            ? buildLayout(storeSubtitle.trim(), tpSub, innerW, Layout.Alignment.ALIGN_CENTER)
+            : null;
 
         // 2. 取餐號與時間區 (使用自動換行避免字體放大後右邊被切掉)
-        String callHeader = order.callNum + "  [" + order.orderType + "]  " + order.time;
+        String callHeader = order.callNum + "  [" + order.orderType + "]  " + order.time
+            + ((order.staffName != null && !order.staffName.isEmpty()) ? "  經手:" + order.staffName : "");
         StaticLayout slCall = buildLayout(callHeader, tpCall, innerW, Layout.Alignment.ALIGN_NORMAL);
 
         // 3. 逐筆品項（主品項放大粗體 + 客製明細縮排自動換行）
@@ -377,15 +419,19 @@ public class PosPrintEngine {
             String cashLine = "實收：$" + order.cashReceived + "   找零：$" + order.cashChange;
             slCash = buildLayout(cashLine, tpItem, innerW, Layout.Alignment.ALIGN_NORMAL);
         }
+        StaticLayout slCustomFooter = (storeReceiptFooter != null && !storeReceiptFooter.trim().isEmpty())
+            ? buildLayout(storeReceiptFooter.trim(), tpSub, innerW, Layout.Alignment.ALIGN_CENTER)
+            : null;
 
         // 計算總高度
-        int totalH = 24 + slStore.getHeight() + 4 + slAddr.getHeight() + 14
+        int totalH = 24 + slStore.getHeight() + 4 + (slAddr != null ? slAddr.getHeight() + 14 : 8)
             + slCall.getHeight() + 20;
         for (StaticLayout sl : itemLayouts) {
             totalH += sl.getHeight() + 6;
         }
         totalH += 24 + slTotal.getHeight() + 10;
         if (slCash != null) totalH += slCash.getHeight() + 10;
+        if (slCustomFooter != null) totalH += slCustomFooter.getHeight() + 12;
         totalH += 30;
 
         Bitmap bmp = Bitmap.createBitmap(totalDots, totalH, Bitmap.Config.ARGB_8888);
@@ -400,8 +446,12 @@ public class PosPrintEngine {
         drawStaticLayout(canvas, slStore, leftPad, y);
         y += slStore.getHeight() + 4;
 
-        drawStaticLayout(canvas, slAddr, leftPad, y);
-        y += slAddr.getHeight() + 10;
+        if (slAddr != null) {
+            drawStaticLayout(canvas, slAddr, leftPad, y);
+            y += slAddr.getHeight() + 10;
+        } else {
+            y += 6;
+        }
 
         drawStaticLayout(canvas, slCall, leftPad, y);
         y += slCall.getHeight() + 8;
@@ -424,6 +474,10 @@ public class PosPrintEngine {
 
         if (slCash != null) {
             drawStaticLayout(canvas, slCash, leftPad, y);
+            y += slCash.getHeight() + 6;
+        }
+        if (slCustomFooter != null) {
+            drawStaticLayout(canvas, slCustomFooter, leftPad, y + 4);
         }
 
         return bmp;
@@ -449,7 +503,7 @@ public class PosPrintEngine {
         float widthFactor = (totalDots <= 400) ? 0.82f : 1.0f;
 
         StringBuilder sb = new StringBuilder();
-        sb.append("伊凡的花園 - 每日關帳日結單\n");
+        sb.append(getEffectiveShortName()).append(" - 每日關帳日結單\n");
         sb.append("時間：").append(cr.time).append("\n");
         sb.append("========================\n");
         sb.append("有效訂單：").append(cr.validCount).append(" 筆\n");
@@ -474,6 +528,49 @@ public class PosPrintEngine {
         TextPaint tp = makeBoldPaint(25f * widthFactor * scale);
         StaticLayout layout = buildLayout(sb.toString(), tp, innerW, Layout.Alignment.ALIGN_NORMAL);
 
+        int h = layout.getHeight() + 50;
+        Bitmap bmp = Bitmap.createBitmap(totalDots, h, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bmp);
+        canvas.drawColor(Color.WHITE);
+        drawStaticLayout(canvas, layout, leftPad, 16);
+        return bmp;
+    }
+
+    public static Bitmap renderShiftHandoverBitmap(MainActivity.ShiftHandoverRecord sh, int widthMm) {
+        int totalDots = Math.max(320, (receiptPrintableDots / 8) * 8);
+        int leftPad = Math.max(0, receiptLeftMarginDots);
+        int rightPad = Math.max(8, receiptRightMarginDots);
+        int innerW = Math.max(180, totalDots - leftPad - rightPad);
+
+        float scale = Math.max(0.8f, receiptFontScalePercent / 100f);
+        float widthFactor = (totalDots <= 400) ? 0.82f : 1.0f;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(getEffectiveShortName()).append(" - 班別交班對帳單\n");
+        sb.append("========================\n");
+        sb.append("交班人員：").append(sh.staffName).append("\n");
+        sb.append("開班時間：").append(sh.shiftStart).append("\n");
+        sb.append("交班時間：").append(sh.shiftEnd).append("\n");
+        sb.append("------------------------\n");
+        sb.append("本班有效單：").append(sh.orderCount).append(" 筆\n");
+        sb.append("本班作廢單：").append(sh.voidCount).append(" 筆\n");
+        sb.append("期初備用金：$").append(sh.openingCash).append("\n");
+        sb.append("本班現金收入：$").append(sh.cashSales).append("\n");
+        sb.append("本班非現金收入：$").append(sh.nonCashSales).append("\n");
+        sb.append("========================\n");
+        sb.append("錢櫃應有現金：$").append(sh.expectedCash).append("\n");
+        sb.append("實點現金金額：$").append(sh.countedCash).append("\n");
+        String diffPrefix = sh.diffCash > 0 ? "+" : "";
+        sb.append("盤點溢/短差：").append(diffPrefix).append("$").append(sh.diffCash).append("\n");
+        if (sh.note != null && !sh.note.trim().isEmpty()) {
+            sb.append("備註：").append(sh.note.trim()).append("\n");
+        }
+        sb.append("========================\n");
+        sb.append("交班人簽名：____________\n");
+        sb.append("接班人簽名：____________\n");
+
+        TextPaint tp = makeBoldPaint(25f * widthFactor * scale);
+        StaticLayout layout = buildLayout(sb.toString(), tp, innerW, Layout.Alignment.ALIGN_NORMAL);
         int h = layout.getHeight() + 50;
         Bitmap bmp = Bitmap.createBitmap(totalDots, h, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(bmp);
@@ -586,7 +683,7 @@ public class PosPrintEngine {
         // 4. 底部店名、時間與單價
         canvas.drawLine(pad, H - 34, W - pad, H - 34, divPaint);
         TextPaint tpFooter = makeBoldPaint(18f * scale);
-        canvas.drawText("伊凡的花園 " + time, pad, H - 10, tpFooter);
+        canvas.drawText(getEffectiveShortName() + " " + time, pad, H - 10, tpFooter);
         tpFooter.setTextAlign(Paint.Align.RIGHT);
         canvas.drawText("$" + unitPrice, W - pad, H - 10, tpFooter);
 

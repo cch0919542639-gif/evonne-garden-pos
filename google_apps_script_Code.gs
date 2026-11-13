@@ -1,14 +1,28 @@
 /**
- * 伊凡的花園 Evonne's Garden - 平板 POS 雲端資料庫 & 手機掃碼點餐系統 (Google Apps Script v3)
+ * 智慧餐飲平板 POS - 雲端資料庫 & 手機掃碼點餐系統 (Google Apps Script v6 - 多店白牌版)
  *
  * 【功能總覽】：
- * 1. 📱 客人手機掃碼線上點餐系統 (doGet ?page=order&table=1桌~13桌)：
- *    - 客人用手機相機或 LINE 掃描桌牌 QR Code，免裝 App 直接開啟 RWD 手機點餐網頁。
- *    - 完整支援：麻辣燙/藥膳燙選湯頭、主餐升級(焗烤/松露/全素起司)、隨餐附贈冷壓萃茶或補差價換購飲品、飲品甜度/冰量/加料、信用卡/現金/LINE Pay 付款偏好。
- *    - 送出後寫入「📱 線上掃碼待接訂單」工作表，店內平板 POS 自動跳出「🔔 掃碼待接(N)」提示並可一鍵接單印收據與貼紙！
- * 2. 📊 營收與餐點統計看板：
- *    - 支援「近7天」、「前兩週(近14天)」、「本月累計」、「上個月」與「自訂日期區間(B2~D2)」自動統計（含現金、信用卡、LINE Pay、街口、外送平台與餐點銷量排行）。
+ * 1. 📱 客人手機掃碼線上點餐系統 (doGet ?page=order&table=1桌~13桌)
+ * 2. 📊 營收與餐點統計看板（近7天 / 14天 / 本月 / 上月 / 自訂日期區間）
+ * 3. 🛡️ Google 雲端硬碟私人資料夾完整系統快照備份 & 換機一鍵回復
  */
+
+function getStoreMeta() {
+  var props = PropertiesService.getScriptProperties();
+  return {
+    storeName: props.getProperty("STORE_NAME") || "智慧餐飲門市",
+    storeShortName: props.getProperty("STORE_SHORT_NAME") || "智慧餐飲",
+    backupFolder: props.getProperty("BACKUP_FOLDER_NAME") || "POS營業備份"
+  };
+}
+
+function saveStoreMetaFromPayload(payload) {
+  if (!payload) return;
+  var props = PropertiesService.getScriptProperties();
+  if (payload.storeName) props.setProperty("STORE_NAME", String(payload.storeName));
+  if (payload.storeShortName) props.setProperty("STORE_SHORT_NAME", String(payload.storeShortName));
+  if (payload.folderName) props.setProperty("BACKUP_FOLDER_NAME", String(payload.folderName));
+}
 
 function doGet(e) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -20,10 +34,11 @@ function doGet(e) {
     return renderMobileOrderWebApp(ss, tableParam);
   }
 
+  var meta = getStoreMeta();
   return ContentService.createTextOutput(
     JSON.stringify({
       status: "ok",
-      store: "伊凡的花園 Evonne's Garden",
+      store: meta.storeName,
       message: "POS 雲端試算表與手機掃碼點餐系統連線正常！(欲測試手機點餐請於網址後加上 ?page=order&table=1桌)"
     })
   ).setMimeType(ContentService.MimeType.JSON);
@@ -179,6 +194,7 @@ function doPost(e) {
 
     // ==================== 5. 平板菜單上傳備份至試算表 ====================
     if (action === "upload_menu") {
+      saveStoreMetaFromPayload(payload);
       var sheetMenu = ss.getSheetByName("菜單設定表");
       sheetMenu.clearContents();
       sheetMenu.appendRow([
@@ -206,8 +222,10 @@ function doPost(e) {
 
     // ==================== 7. 店家私人 Google 雲端硬碟完整系統快照備份 (DriveApp) ====================
     if (action === "backup_full_snapshot") {
+      saveStoreMetaFromPayload(payload);
       var snap = payload.snapshot || {};
-      var folderName = "伊凡的花園_POS營業備份";
+      var meta = getStoreMeta();
+      var folderName = String(payload.folderName || meta.backupFolder || "POS營業備份");
       var folder = getOrCreateDriveFolder(folderName);
       var stamp = Utilities.formatDate(new Date(), "GMT+8", "yyyy-MM-dd_HHmm");
       var fileName = "POS_完整備份_" + stamp + ".json";
@@ -229,10 +247,20 @@ function doPost(e) {
 
     // ==================== 8. 從店家私人 Google 雲端硬碟一鍵讀取最新完整備份 ====================
     if (action === "restore_latest_snapshot") {
-      var rFolder = getOrCreateDriveFolder("伊凡的花園_POS營業備份");
-      var files = rFolder.getFilesByName("POS_最新備份_LATEST.json");
-      if (!files.hasNext()) {
-        return jsonResponse({ status: "empty", message: "雲端資料夾「伊凡的花園_POS營業備份」尚無備份檔，請先於原平板點「☁️ 完整備份至店家 Google 雲端硬碟」。" });
+      var metaR = getStoreMeta();
+      var targetFolder = String(payload.folderName || metaR.backupFolder || "");
+      var files = null;
+      if (targetFolder) {
+        var folders = DriveApp.getFoldersByName(targetFolder);
+        if (folders.hasNext()) {
+          files = folders.next().getFilesByName("POS_最新備份_LATEST.json");
+        }
+      }
+      if (!files || !files.hasNext()) {
+        files = DriveApp.getFilesByName("POS_最新備份_LATEST.json");
+      }
+      if (!files || !files.hasNext()) {
+        return jsonResponse({ status: "empty", message: "Google 雲端硬碟尚無備份檔 (POS_最新備份_LATEST.json)，請先於原平板執行雲端完整備份。" });
       }
       var content = files.next().getBlob().getDataAsString("UTF-8");
       var parsedSnap = JSON.parse(content);
@@ -294,7 +322,8 @@ function initDashboardSheet(ss) {
   if (dash) return;
   dash = ss.insertSheet(name, 0);
 
-  dash.getRange("A1").setValue("🌿 伊凡的花園 — 區間營收與餐點銷售自動統計看板（修改黃色日期格即可自動查詢任意月份或區間）");
+  var meta = getStoreMeta();
+  dash.getRange("A1").setValue("🏪 " + meta.storeShortName + " — 區間營收與餐點銷售自動統計看板（修改黃色日期格即可自動查詢任意月份或區間）");
   dash.getRange("A1").setFontWeight("bold").setFontSize(13);
 
   dash.getRange("A2").setValue("查詢起始日期：");
@@ -377,10 +406,12 @@ function renderMobileOrderWebApp(ss, defaultTable) {
   var menuList = loadMenuFromSheet(ss);
   var menuJson = JSON.stringify(menuList);
   var safeTable = String(defaultTable || "1桌").replace(/["<>]/g, "");
+  var meta = getStoreMeta();
+  var safeBrand = String(meta.storeShortName || meta.storeName || "智慧餐飲").replace(/["<>]/g, "");
 
   var html = '<!DOCTYPE html><html lang="zh-TW"><head><meta charset="UTF-8">'
     + '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">'
-    + '<title>伊凡的花園 - 線上掃碼點餐</title>'
+    + '<title>' + safeBrand + ' - 線上掃碼點餐</title>'
     + '<style>'
     + '*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}'
     + 'body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC",sans-serif;background:#0F172A;color:#F8FAFC;padding-bottom:110px;font-size:17px;}'
@@ -408,7 +439,7 @@ function renderMobileOrderWebApp(ss, defaultTable) {
     + '.chip.sel{background:#10B981;color:#052E16;font-weight:900;border-color:#6EE7B7;}'
     + '</style></head><body>'
     + '<div class="header">'
-    + '  <div class="brand"><span>🌿 伊凡的花園</span><span class="table-badge">🪑 ' + safeTable + '</span></div>'
+    + '  <div class="brand"><span>🏪 ' + safeBrand + '</span><span class="table-badge">🪑 ' + safeTable + '</span></div>'
     + '  <div class="sub-banner">請點選下方分類與餐點，送出後由櫃檯為您確認製作</div>'
     + '</div>'
     + '<div id="catBar" class="cats"></div>'
@@ -642,7 +673,7 @@ function renderMobileOrderWebApp(ss, defaultTable) {
     + '</script></body></html>';
 
   return HtmlService.createHtmlOutput(html)
-    .setTitle("伊凡的花園 - 線上掃碼點餐 (" + safeTable + ")")
+    .setTitle(safeBrand + " - 線上掃碼點餐 (" + safeTable + ")")
     .addMetaTag("viewport", "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no")
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }

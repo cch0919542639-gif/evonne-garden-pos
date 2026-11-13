@@ -154,8 +154,10 @@ public class QrCodeGenerator {
         tpHint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
         tpHint.setTextSize(24f);
 
+        String storeLabel = (PosPrintEngine.storeName != null && !PosPrintEngine.storeName.trim().isEmpty())
+            ? PosPrintEngine.storeName.trim() : "智慧餐飲 POS";
         StaticLayout slStore = StaticLayout.Builder
-            .obtain("🌿 伊凡的花園 Evonne's Garden", 0, "🌿 伊凡的花園 Evonne's Garden".length(), tpStore, innerW)
+            .obtain(storeLabel, 0, storeLabel.length(), tpStore, innerW)
             .setAlignment(Layout.Alignment.ALIGN_CENTER)
             .build();
 

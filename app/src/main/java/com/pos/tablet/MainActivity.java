@@ -216,6 +216,40 @@ public class MainActivity extends Activity {
         public boolean printReceipt;
         public int stickerCount;
         public boolean voided = false;
+        public String staffName = "";
+    }
+
+    public static class StaffMember {
+        public long id = -1;
+        public String name;
+        public String role = "店員"; // "店長" or "店員"
+        public String pin = "";
+        public boolean enabled = true;
+    }
+
+    public static class ShiftHandoverRecord {
+        public long id = -1;
+        public String shiftStart;
+        public String shiftEnd;
+        public String staffName;
+        public int openingCash;
+        public int cashSales;
+        public int nonCashSales;
+        public int expectedCash;
+        public int countedCash;
+        public int diffCash;
+        public int orderCount;
+        public int voidCount;
+        public String note = "";
+    }
+
+    public static class AuditLogRecord {
+        public long id = -1;
+        public String createdAt;
+        public String staffName;
+        public String actionType;
+        public String targetRef;
+        public String detail;
     }
 
     public static class ClosingRecord {
@@ -256,6 +290,16 @@ public class MainActivity extends Activity {
         "https://raw.githubusercontent.com/cch0919542639-gif/evonne-garden-pos/main/version.json";
     private String otaManifestUrl = DEFAULT_OTA_MANIFEST_URL;
     private String managerPin = "";
+
+    // 彈性員工權限 / 交班盤點 / 稽核日誌設定（可讓小店極簡免切換，也可讓多員工分權稽核）
+    private boolean staffModeEnabled = false;
+    private boolean shiftHandoverEnabled = false;
+    private boolean auditLogEnabled = false;
+    private String currentStaffName = "店長";
+    private String currentStaffRole = "店長";
+    private String shiftStartTime = "";
+    private long lastHandoverOrderDbId = 0L;
+    private final List<StaffMember> staffMembers = new ArrayList<>();
 
     private final List<MenuItem> menuItems = new ArrayList<>();
     private final List<DrinkUpgradeOption> mealDrinkPool = new ArrayList<>();
@@ -302,7 +346,7 @@ public class MainActivity extends Activity {
     };
 
     // ==================== UI REFERENCES ====================
-    private TextView tvTopCallNum, tvPrinterStatusBadge;
+    private TextView tvBrand, tvTopCallNum, tvPrinterStatusBadge, tvStaffBadge;
     private Button btnTabPos, btnTabQrOrders, btnTabOrders, btnTabClosing, btnTabSettings;
     private LinearLayout viewPos, viewOrders, viewClosing, viewSettings;
 
@@ -340,9 +384,9 @@ public class MainActivity extends Activity {
         }
 
         dbHelper = new PosDatabaseHelper(this);
-        initMenuData();
-        loadDatabaseState();
+        boolean isFirstFreshInstall = loadDatabaseState();
         buildRootUI();
+        updateBrandAndStaffHeader();
         updateOrdersBadge();
         refreshAllPosViews();
         handleIncomingConfigIntent();
@@ -354,6 +398,9 @@ public class MainActivity extends Activity {
                     if (ok) Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show();
                 }
             });
+        }
+        if (isFirstFreshInstall && (getIntent() == null || !getIntent().hasExtra("set_sheet_url"))) {
+            showStoreOnboardingDialog();
         }
     }
 
@@ -486,13 +533,40 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void loadDatabaseState() {
-        dbHelper.seedMenuIfEmpty(menuItems);
-        List<MenuItem> storedMenu = dbHelper.loadMenuItems();
-        if (!storedMenu.isEmpty()) {
-            menuItems.clear();
-            menuItems.addAll(storedMenu);
+    private boolean loadDatabaseState() {
+        boolean isFirstFreshInstall = false;
+        String initializedFlag = dbHelper.getSetting("store_initialized", "");
+        if (initializedFlag == null || initializedFlag.isEmpty()) {
+            boolean hasLegacy = dbHelper.hasAnyMenuOrHistory()
+                || !dbHelper.getSetting("google_sheet_url", "").isEmpty()
+                || !dbHelper.getSetting("receipt_ip", "").isEmpty();
+            if (hasLegacy) {
+                // 舊版門市平板無痛升級：自動保留原門市品牌資料
+                dbHelper.setSetting("store_code", "EVONNE-001");
+                dbHelper.setSetting("store_name", "伊凡的花園 Evonne's Garden");
+                dbHelper.setSetting("store_short_name", "伊凡的花園");
+                dbHelper.setSetting("store_subtitle", "高雄市三民區龍江街120號｜0982-708-572");
+                dbHelper.setSetting("store_initialized", "1");
+            } else {
+                isFirstFreshInstall = true;
+                dbHelper.setSetting("store_code", "STORE-001");
+                dbHelper.setSetting("store_name", "我的餐飲門市");
+                dbHelper.setSetting("store_short_name", "我的門市");
+                dbHelper.setSetting("store_subtitle", "");
+            }
         }
+
+        PosPrintEngine.storeCode = dbHelper.getSetting("store_code", "STORE-001");
+        PosPrintEngine.storeName = dbHelper.getSetting("store_name", "我的餐飲門市");
+        PosPrintEngine.storeShortName = dbHelper.getSetting("store_short_name", "我的門市");
+        PosPrintEngine.storeSubtitle = dbHelper.getSetting("store_subtitle", "");
+        PosPrintEngine.storeReceiptFooter = dbHelper.getSetting("store_receipt_footer", "");
+
+        List<MenuItem> storedMenu = dbHelper.loadMenuItems();
+        menuItems.clear();
+        menuItems.addAll(storedMenu);
+        rebuildMealDrinkPool();
+
         callSequence = dbHelper.getIntSetting("call_sequence", 1);
         openingFloat = dbHelper.getIntSetting("opening_float", 2000);
         receiptIp = dbHelper.getSetting("receipt_ip", "192.168.0.200");
@@ -511,6 +585,28 @@ public class MainActivity extends Activity {
         googleSheetUrl = dbHelper.getSetting("google_sheet_url", "");
         otaManifestUrl = dbHelper.getSetting("ota_manifest_url", DEFAULT_OTA_MANIFEST_URL);
         managerPin = dbHelper.getSetting("manager_pin", "");
+
+        staffModeEnabled = "1".equals(dbHelper.getSetting("staff_mode_enabled", "0"));
+        shiftHandoverEnabled = "1".equals(dbHelper.getSetting("shift_handover_enabled", "0"));
+        auditLogEnabled = "1".equals(dbHelper.getSetting("audit_log_enabled", "0"));
+        currentStaffName = dbHelper.getSetting("current_staff_name", "店長");
+        currentStaffRole = dbHelper.getSetting("current_staff_role", "店長");
+        shiftStartTime = dbHelper.getSetting("shift_start_time", "");
+        if (shiftStartTime.isEmpty()) {
+            shiftStartTime = new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.TAIWAN).format(new Date());
+            dbHelper.setSetting("shift_start_time", shiftStartTime);
+        }
+        try {
+            lastHandoverOrderDbId = Long.parseLong(dbHelper.getSetting("last_handover_order_id", "0"));
+        } catch (Exception e) {
+            lastHandoverOrderDbId = 0L;
+        }
+        if (staffModeEnabled) {
+            dbHelper.seedDefaultStaffIfEmpty(managerPin);
+        }
+        staffMembers.clear();
+        staffMembers.addAll(dbHelper.loadStaffMembers());
+
         loadTableFloorSlotsFromDb();
 
         ordersHistory.clear();
@@ -518,6 +614,7 @@ public class MainActivity extends Activity {
 
         closingHistory.clear();
         closingHistory.addAll(dbHelper.loadClosingHistory());
+        return isFirstFreshInstall;
     }
 
     private int dp(int v) {
@@ -539,6 +636,18 @@ public class MainActivity extends Activity {
     private boolean shouldPrintLabelByDefault(boolean isDrink, String orderType) {
         if (isDrink) return true;
         return !"內用".equals(orderType);
+    }
+
+    private void rebuildMealDrinkPool() {
+        mealDrinkPool.clear();
+        // 建立主餐隨餐附飲 & 補差價換購池（原附飲折抵 $30）
+        for (MenuItem m : menuItems) {
+            if (m.isDrink) {
+                int diff = Math.max(0, m.price - 30);
+                mealDrinkPool.add(new DrinkUpgradeOption(m.cat, m.name, diff, m.fixedSweet, m.coldOnly, m.isThickMilk));
+            }
+        }
+        mealDrinkPool.add(new DrinkUpgradeOption("冷壓萃茶", "不需附茶", 0, true, true, false));
     }
 
     private void initMenuData() {
@@ -658,14 +767,7 @@ public class MainActivity extends Activity {
         menuItems.add(new MenuItem(1207, "獨家厚奶", "▲冬瓜濃奶", "▲甜度固定｜可+$10鮮奶", 50, true, false, true, false, true, null));
         menuItems.add(new MenuItem(1208, "獨家厚奶", "▲蜂蜜濃奶", "▲甜度固定｜可+$10鮮奶", 50, true, false, true, false, true, null));
 
-        // 建立主餐隨餐附飲 & 補差價換購池（原附冷壓萃茶 $30，換購其他飲品折抵 $30）
-        for (MenuItem m : menuItems) {
-            if (m.isDrink) {
-                int diff = Math.max(0, m.price - 30);
-                mealDrinkPool.add(new DrinkUpgradeOption(m.cat, m.name, diff, m.fixedSweet, m.coldOnly, m.isThickMilk));
-            }
-        }
-        mealDrinkPool.add(new DrinkUpgradeOption("冷壓萃茶", "不需附茶", 0, true, true, false));
+        rebuildMealDrinkPool();
     }
 
     // ==================== ROOT UI CONSTRUCTION ====================
@@ -681,8 +783,8 @@ public class MainActivity extends Activity {
         topBar.setBackgroundColor(Color.parseColor("#062419"));
         topBar.setPadding(dp(12), dp(6), dp(12), dp(6));
 
-        TextView tvBrand = new TextView(this);
-        tvBrand.setText("🌿 伊凡的花園 POS");
+        tvBrand = new TextView(this);
+        tvBrand.setText("🏪 " + PosPrintEngine.getEffectiveShortName() + " POS");
         tvBrand.setTextColor(Color.parseColor("#A7F3D0"));
         tvBrand.setTextSize(17);
         tvBrand.setTypeface(null, Typeface.BOLD);
@@ -714,6 +816,20 @@ public class MainActivity extends Activity {
         lpPrn.leftMargin = dp(6);
         topBar.addView(tvPrinterStatusBadge, lpPrn);
 
+        tvStaffBadge = new TextView(this);
+        tvStaffBadge.setTextColor(Color.parseColor("#E0F2FE"));
+        tvStaffBadge.setTextSize(11);
+        tvStaffBadge.setTypeface(null, Typeface.BOLD);
+        tvStaffBadge.setBackground(roundBg(Color.parseColor("#0369A1"), Color.parseColor("#38BDF8"), 1, 6));
+        tvStaffBadge.setPadding(dp(8), dp(4), dp(8), dp(4));
+        tvStaffBadge.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { showSwitchStaffDialog(); }
+        });
+        LinearLayout.LayoutParams lpStaff = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lpStaff.leftMargin = dp(6);
+        topBar.addView(tvStaffBadge, lpStaff);
+
         View spacer = new View(this);
         topBar.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
 
@@ -731,7 +847,7 @@ public class MainActivity extends Activity {
         });
         btnTabSettings = makeTopTabBtn("⚙️ 雙機與設定", false, new View.OnClickListener() {
             @Override public void onClick(View v) {
-                requireManagerPinIfSet("進入雙機與系統設定", new Runnable() {
+                authorizeAction("進入雙機與系統設定", true, new Runnable() {
                     @Override public void run() { switchMainTab(3); }
                 });
             }
@@ -768,6 +884,20 @@ public class MainActivity extends Activity {
         root.addView(viewSettings, lpFill);
 
         setContentView(root);
+    }
+
+    private void updateBrandAndStaffHeader() {
+        if (tvBrand != null) {
+            tvBrand.setText("🏪 " + PosPrintEngine.getEffectiveShortName() + " POS");
+        }
+        if (tvStaffBadge != null) {
+            if (staffModeEnabled) {
+                tvStaffBadge.setVisibility(View.VISIBLE);
+                tvStaffBadge.setText("👤 " + currentStaffName + " (" + currentStaffRole + ") ▾");
+            } else {
+                tvStaffBadge.setVisibility(View.GONE);
+            }
+        }
     }
 
     private Button makeTopTabBtn(String text, boolean active, View.OnClickListener listener) {
@@ -1099,6 +1229,9 @@ public class MainActivity extends Activity {
         for (MenuItem m : menuItems) {
             if (!cats.contains(m.cat)) cats.add(m.cat);
         }
+        if (!cats.isEmpty() && !cats.contains(currentCategory)) {
+            currentCategory = cats.get(0);
+        }
         for (final String c : cats) {
             Button b = new Button(this);
             b.setText(c);
@@ -1196,6 +1329,15 @@ public class MainActivity extends Activity {
 
     private void refreshMenuGrid() {
         glMenuGrid.removeAllViews();
+        if (menuItems.isEmpty()) {
+            TextView tvEmptyMenu = new TextView(this);
+            tvEmptyMenu.setText("📋 目前尚無菜單品項。\n請點右上角「⚙️ 雙機與設定」新增品項、匯入示範菜單，或從雲端/本機快照回復資料。");
+            tvEmptyMenu.setTextColor(Color.parseColor("#CBD5E1"));
+            tvEmptyMenu.setTextSize(14);
+            tvEmptyMenu.setPadding(dp(16), dp(24), dp(16), dp(24));
+            glMenuGrid.addView(tvEmptyMenu);
+            return;
+        }
         int screenW = getResources().getDisplayMetrics().widthPixels;
         int leftW = (int) (screenW * 0.60f) - dp(24);
         int cardW = (leftW / 3) - dp(6);
@@ -1339,7 +1481,7 @@ public class MainActivity extends Activity {
         llCartList.removeAllViews();
         if (cart.isEmpty()) {
             TextView tvEmpty = new TextView(this);
-            tvEmpty.setText("👆 點選左側【伊凡的花園】菜單品項\n\n• 主餐可免費選冷壓萃茶，或補差價換購冬瓜檸檬等全店飲品\n• 飲品可加寒天愛玉+$15、椰果+$10、厚奶(濃奶)+$20、鮮奶+$30\n• 麻辣燙/藥膳燙支援一鍵秒換湯頭");
+            tvEmpty.setText("👆 點選左側【" + PosPrintEngine.getEffectiveShortName() + "】菜單品項\n\n• 支援主餐隨附飲品或加價換購、甜度/冰量/加料客製\n• 點選右側可即時調整數量、單品折讓、整單折扣\n• 支援斷網離線照常點餐與印單，恢復網路自動同步");
             tvEmpty.setTextColor(Color.parseColor("#94A3B8"));
             tvEmpty.setTextSize(12);
             tvEmpty.setGravity(Gravity.CENTER);
@@ -2058,6 +2200,11 @@ public class MainActivity extends Activity {
                     else if (which == 4) orderDiscount = 50;
                     else if (which == 5) orderDiscount = totalBefore;
                     else orderDiscount = 0;
+                    if (orderDiscount > 0 && (auditLogEnabled || staffModeEnabled)) {
+                        dbHelper.insertAuditLog(
+                            staffModeEnabled ? currentStaffName : "店長",
+                            "ORDER_DISCOUNT", "購物車折扣", "折讓 -$" + orderDiscount);
+                    }
                     refreshCartUI();
                 }
             })
@@ -2086,7 +2233,7 @@ public class MainActivity extends Activity {
         header.setPadding(dp(12), dp(6), dp(12), dp(6));
 
         final TextView tvTitle = new TextView(this);
-        tvTitle.setText("🗺️ 伊凡的花園 — 視覺化桌位點選 (點擊桌位立即帶入，預設 1~13 桌)");
+        tvTitle.setText("🗺️ " + PosPrintEngine.getEffectiveShortName() + " — 視覺化桌位點選 (點擊桌位立即帶入)");
         tvTitle.setTextColor(Color.parseColor("#A7F3D0"));
         tvTitle.setTextSize(15);
         tvTitle.setTypeface(null, Typeface.BOLD);
@@ -2300,7 +2447,7 @@ public class MainActivity extends Activity {
                 btnToggleEdit.setTextColor(editMode[0] ? Color.parseColor("#052E16") : Color.WHITE);
                 tvTitle.setText(editMode[0]
                     ? "✏️ 餐廳桌位排列編輯模式 (點選桌號再點空位即可自由排列位置)"
-                    : "🗺️ 伊凡的花園 — 視覺化桌位點選 (點擊桌位立即帶入，預設 1~13 桌)");
+                    : "🗺️ " + PosPrintEngine.getEffectiveShortName() + " — 視覺化桌位點選 (點擊桌位立即帶入)");
                 rebuildFloorMap.run();
             }
         });
@@ -2809,6 +2956,7 @@ public class MainActivity extends Activity {
             rec.cashChange = 0;
             rec.printReceipt = globalPrintReceipt;
             rec.stickerCount = getTotalStickersCount();
+            rec.staffName = staffModeEnabled ? currentStaffName : "";
 
             dbHelper.insertOrder(rec);
             ordersHistory.add(0, rec);
@@ -2941,6 +3089,7 @@ public class MainActivity extends Activity {
                 rec.cashChange = Math.max(0, cashRec - due);
                 rec.printReceipt = globalPrintReceipt;
                 rec.stickerCount = getTotalStickersCount();
+                rec.staffName = staffModeEnabled ? currentStaffName : "";
 
                 // 寫入本地 SQLite 資料庫並持久化下一單取餐號
                 dbHelper.insertOrder(rec);
@@ -2975,9 +3124,15 @@ public class MainActivity extends Activity {
         StringBuilder sb = new StringBuilder();
         if (order.printReceipt) {
             sb.append("========== [HPRT TP805L 收據/廚房總單 (").append(receiptIp).append(":").append(receiptPort).append(")] ==========\n");
-            sb.append("        伊凡的花園 Evonne's Garden\n");
-            sb.append("   高雄市三民區龍江街120號｜0982-708-572\n");
-            sb.append("   取餐號：").append(order.callNum).append("  [").append(order.orderType).append("]  ").append(order.time).append("\n");
+            sb.append("        ").append(PosPrintEngine.storeName).append("\n");
+            if (PosPrintEngine.storeSubtitle != null && !PosPrintEngine.storeSubtitle.trim().isEmpty()) {
+                sb.append("   ").append(PosPrintEngine.storeSubtitle.trim()).append("\n");
+            }
+            sb.append("   取餐號：").append(order.callNum).append("  [").append(order.orderType).append("]  ").append(order.time);
+            if (order.staffName != null && !order.staffName.isEmpty()) {
+                sb.append("  經手:").append(order.staffName);
+            }
+            sb.append("\n");
             sb.append("------------------------------------------------\n");
             for (CartItem ci : order.items) {
                 sb.append("• ").append(ci.menu.name).append(" x").append(ci.qty)
@@ -2992,12 +3147,16 @@ public class MainActivity extends Activity {
             if ("現金".equals(order.paymentMethod)) {
                 sb.append("實收：$").append(order.cashReceived).append("  找零：$").append(order.cashChange).append("\n");
             }
+            if (PosPrintEngine.storeReceiptFooter != null && !PosPrintEngine.storeReceiptFooter.trim().isEmpty()) {
+                sb.append(PosPrintEngine.storeReceiptFooter.trim()).append("\n");
+            }
             sb.append("\n");
         }
 
         if (order.stickerCount > 0) {
             sb.append("========== [GoDEX DT2x 40×30mm 標籤貼紙 (").append(labelIp).append(":").append(labelPort).append(")] ==========\n");
             int cur = 1;
+            String shortBrand = PosPrintEngine.getEffectiveShortName();
             for (CartItem ci : order.items) {
                 if (ci.printLabel) {
                     for (int k = 0; k < ci.qty; k++) {
@@ -3006,7 +3165,7 @@ public class MainActivity extends Activity {
                           .append(cur).append("/").append(order.stickerCount).append(") │\n");
                         sb.append("│ ").append(ci.menu.name).append("\n");
                         sb.append("│ ").append(ci.getModSummary()).append("\n");
-                        sb.append("│ 伊凡的花園 ").append(order.time).append("        $")
+                        sb.append("│ ").append(shortBrand).append(" ").append(order.time).append("        $")
                           .append(ci.getSubTotal() / Math.max(1, ci.qty)).append(" │\n");
                         sb.append("└──────────────────────────────┘\n");
                         cur++;
@@ -3019,7 +3178,7 @@ public class MainActivity extends Activity {
                           .append(cur).append("/").append(order.stickerCount).append(") │\n");
                         sb.append("│ [附飲] ").append(ci.mealDrinkName).append("\n");
                         sb.append("│ ").append(ci.getAttachedDrinkModSummary()).append("\n");
-                        sb.append("│ 伊凡的花園 ").append(order.time).append("        $")
+                        sb.append("│ ").append(shortBrand).append(" ").append(order.time).append("        $")
                           .append(Math.max(0, ci.mealDrinkDiff)).append(" │\n");
                         sb.append("└──────────────────────────────┘\n");
                         cur++;
@@ -3128,6 +3287,7 @@ public class MainActivity extends Activity {
 
             TextView tvInfo = new TextView(this);
             tvInfo.setText(o.callNum + " [" + o.orderType + "] " + o.time
+                + ((o.staffName != null && !o.staffName.isEmpty()) ? " 👤" + o.staffName : "")
                 + (o.voided ? " (❌已作廢)" : " (✅有效)")
                 + "\n" + desc.toString() + " ｜ " + o.paymentMethod + " $" + o.total);
             tvInfo.setTextColor(o.voided ? Color.parseColor("#EF4444") : Color.WHITE);
@@ -3192,10 +3352,16 @@ public class MainActivity extends Activity {
                 btnVoid.setBackground(roundBg(Color.parseColor("#EF4444"), 0, 0, 6));
                 btnVoid.setOnClickListener(new View.OnClickListener() {
                     @Override public void onClick(View v) {
-                        requireManagerPinIfSet("作廢退單 (" + o.callNum + ")", new Runnable() {
+                        authorizeAction("作廢退單 (" + o.callNum + ")", true, new Runnable() {
                             @Override public void run() {
                                 o.voided = true;
                                 if (o.dbId > 0) dbHelper.markOrderVoided(o.dbId, true);
+                                if (auditLogEnabled || staffModeEnabled) {
+                                    dbHelper.insertAuditLog(
+                                        staffModeEnabled ? currentStaffName : "店長",
+                                        "VOID_ORDER", o.callNum,
+                                        "作廢退單 $" + o.total + " (" + o.paymentMethod + ")");
+                                }
                                 updateOrdersBadge();
                                 rebuildOrdersTab();
                             }
@@ -3333,7 +3499,17 @@ public class MainActivity extends Activity {
                 closingHistory.add(0, cr);
                 ordersHistory.clear();
                 callSequence = 1;
+                lastHandoverOrderDbId = 0L;
+                shiftStartTime = new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.TAIWAN).format(new Date());
                 dbHelper.setSetting("call_sequence", "1");
+                dbHelper.setSetting("last_handover_order_id", "0");
+                dbHelper.setSetting("shift_start_time", shiftStartTime);
+                if (auditLogEnabled || staffModeEnabled) {
+                    dbHelper.insertAuditLog(
+                        staffModeEnabled ? currentStaffName : "店長",
+                        "DAILY_CLOSING", cr.time,
+                        "日結淨營業額 $" + cr.netSales + " (有效 " + cr.validCount + " 筆)");
+                }
                 tvTopCallNum.setText("取餐號 #001");
                 updateOrdersBadge();
                 rebuildClosingTab();
@@ -3387,6 +3563,53 @@ public class MainActivity extends Activity {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         lpSum.topMargin = dp(8);
         viewClosing.addView(tvSummary, lpSum);
+
+        if (shiftHandoverEnabled || auditLogEnabled || staffModeEnabled) {
+            LinearLayout shiftBar = new LinearLayout(this);
+            shiftBar.setOrientation(LinearLayout.HORIZONTAL);
+            shiftBar.setGravity(Gravity.CENTER_VERTICAL);
+            shiftBar.setBackground(roundBg(Color.parseColor("#172554"), Color.parseColor("#38BDF8"), 1, 8));
+            shiftBar.setPadding(dp(10), dp(6), dp(10), dp(6));
+            LinearLayout.LayoutParams lpSh = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lpSh.topMargin = dp(6);
+            shiftBar.setLayoutParams(lpSh);
+
+            TextView tvShiftInfo = new TextView(this);
+            tvShiftInfo.setText((staffModeEnabled ? "👤 當班：" + currentStaffName + " ｜ " : "")
+                + "開班時間：" + shiftStartTime);
+            tvShiftInfo.setTextColor(Color.parseColor("#E0F2FE"));
+            tvShiftInfo.setTextSize(12);
+            shiftBar.addView(tvShiftInfo, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+            if (shiftHandoverEnabled) {
+                Button btnDoHandover = new Button(this);
+                btnDoHandover.setText("🤝 班別交班盤點");
+                btnDoHandover.setAllCaps(false);
+                btnDoHandover.setTextSize(12);
+                btnDoHandover.setTypeface(null, Typeface.BOLD);
+                btnDoHandover.setTextColor(Color.parseColor("#052E16"));
+                btnDoHandover.setBackground(roundBg(Color.parseColor("#F59E0B"), 0, 0, 6));
+                btnDoHandover.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View v) { showShiftHandoverDialog(); }
+                });
+                LinearLayout.LayoutParams lpHo = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34));
+                lpHo.rightMargin = dp(6);
+                shiftBar.addView(btnDoHandover, lpHo);
+            }
+
+            Button btnViewLogs = new Button(this);
+            btnViewLogs.setText("📜 交班與操作稽核日誌");
+            btnViewLogs.setAllCaps(false);
+            btnViewLogs.setTextSize(12);
+            btnViewLogs.setTextColor(Color.WHITE);
+            btnViewLogs.setBackground(roundBg(Color.parseColor("#334155"), 0, 0, 6));
+            btnViewLogs.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) { showShiftAndAuditLogsDialog(); }
+            });
+            shiftBar.addView(btnViewLogs, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)));
+            viewClosing.addView(shiftBar);
+        }
 
         // ==================== 區間營收與餐點排行快速查詢列 ====================
         LinearLayout rangeBar = new LinearLayout(this);
@@ -3563,6 +3786,128 @@ public class MainActivity extends Activity {
         sv.addView(box);
         viewSettings.addView(sv, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // 0. 門市品牌白牌設定與無痛資料轉移 (商業化多店通用核心)
+        addSectionHeader(box, "🏪 0. 門市品牌、白牌開通設定 & 本機/跨版無痛資料轉移 (Schema v2)");
+        LinearLayout brandPanel = new LinearLayout(this);
+        brandPanel.setOrientation(LinearLayout.VERTICAL);
+        brandPanel.setBackground(roundBg(Color.parseColor("#062419"), Color.parseColor("#10B981"), 1, 8));
+        brandPanel.setPadding(dp(10), dp(8), dp(10), dp(8));
+
+        LinearLayout brandRow1 = new LinearLayout(this);
+        brandRow1.setOrientation(LinearLayout.HORIZONTAL);
+        final EditText etStoreCode = new EditText(this);
+        etStoreCode.setHint("門市代碼 (如 STORE-001)");
+        etStoreCode.setText(PosPrintEngine.storeCode);
+        etStoreCode.setTextColor(Color.parseColor("#FCD34D"));
+        etStoreCode.setTextSize(12);
+        brandRow1.addView(etStoreCode, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.7f));
+
+        final EditText etStoreShort = new EditText(this);
+        etStoreShort.setHint("簡稱 (頂部列/貼紙底欄)");
+        etStoreShort.setText(PosPrintEngine.storeShortName);
+        etStoreShort.setTextColor(Color.WHITE);
+        etStoreShort.setTextSize(12);
+        brandRow1.addView(etStoreShort, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        final EditText etStoreName = new EditText(this);
+        etStoreName.setHint("完整店名 (收據抬頭/桌牌)");
+        etStoreName.setText(PosPrintEngine.storeName);
+        etStoreName.setTextColor(Color.WHITE);
+        etStoreName.setTextSize(12);
+        brandRow1.addView(etStoreName, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.5f));
+        brandPanel.addView(brandRow1);
+
+        LinearLayout brandRow2 = new LinearLayout(this);
+        brandRow2.setOrientation(LinearLayout.HORIZONTAL);
+        final EditText etStoreSub = new EditText(this);
+        etStoreSub.setHint("地址與電話/副標 (如 台北市信義區...｜02-xxxx-xxxx)");
+        etStoreSub.setText(PosPrintEngine.storeSubtitle);
+        etStoreSub.setTextColor(Color.WHITE);
+        etStoreSub.setTextSize(12);
+        brandRow2.addView(etStoreSub, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.4f));
+
+        final EditText etStoreFooter = new EditText(this);
+        etStoreFooter.setHint("收據頁尾備註 (可選，如 Wi-Fi 密碼)");
+        etStoreFooter.setText(PosPrintEngine.storeReceiptFooter);
+        etStoreFooter.setTextColor(Color.parseColor("#CBD5E1"));
+        etStoreFooter.setTextSize(12);
+        brandRow2.addView(etStoreFooter, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        brandPanel.addView(brandRow2);
+
+        LinearLayout brandBtnRow = new LinearLayout(this);
+        brandBtnRow.setOrientation(LinearLayout.HORIZONTAL);
+        Button btnSaveBrand = new Button(this);
+        btnSaveBrand.setText("💾 儲存門市品牌設定");
+        btnSaveBrand.setAllCaps(false);
+        btnSaveBrand.setTextSize(12);
+        btnSaveBrand.setTypeface(null, Typeface.BOLD);
+        btnSaveBrand.setTextColor(Color.parseColor("#052E16"));
+        btnSaveBrand.setBackground(roundBg(Color.parseColor("#10B981"), 0, 0, 6));
+        btnSaveBrand.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                String sc = etStoreCode.getText().toString().trim();
+                String sn = etStoreName.getText().toString().trim();
+                String ss = etStoreShort.getText().toString().trim();
+                String sub = etStoreSub.getText().toString().trim();
+                String ft = etStoreFooter.getText().toString().trim();
+                if (sn.isEmpty()) sn = "我的餐飲門市";
+                if (ss.isEmpty()) ss = sn;
+                if (sc.isEmpty()) sc = "STORE-001";
+                PosPrintEngine.storeCode = sc;
+                PosPrintEngine.storeName = sn;
+                PosPrintEngine.storeShortName = ss;
+                PosPrintEngine.storeSubtitle = sub;
+                PosPrintEngine.storeReceiptFooter = ft;
+                dbHelper.setSetting("store_code", sc);
+                dbHelper.setSetting("store_name", sn);
+                dbHelper.setSetting("store_short_name", ss);
+                dbHelper.setSetting("store_subtitle", sub);
+                dbHelper.setSetting("store_receipt_footer", ft);
+                dbHelper.setSetting("store_initialized", "1");
+                updateBrandAndStaffHeader();
+                refreshCartUI();
+                Toast.makeText(MainActivity.this, "✅ 已儲存門市品牌：【" + ss + "】", Toast.LENGTH_SHORT).show();
+            }
+        });
+        LinearLayout.LayoutParams lpSb = new LinearLayout.LayoutParams(0, dp(36), 1f);
+        lpSb.rightMargin = dp(6);
+        brandBtnRow.addView(btnSaveBrand, lpSb);
+
+        Button btnExportLocalSnap = new Button(this);
+        btnExportLocalSnap.setText("📤 匯出遷移快照 (.json)");
+        btnExportLocalSnap.setAllCaps(false);
+        btnExportLocalSnap.setTextSize(12);
+        btnExportLocalSnap.setTextColor(Color.WHITE);
+        btnExportLocalSnap.setBackground(roundBg(Color.parseColor("#0284C7"), 0, 0, 6));
+        btnExportLocalSnap.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                org.json.JSONObject snap = dbHelper.exportFullSnapshotJson(menuItems, closingHistory);
+                String path = dbHelper.exportSnapshotToLocalFile(snap);
+                new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("✅ 已匯出標準化遷移快照 (Schema v2)")
+                    .setMessage("包含門市設定、完整菜單、桌位排列、員工權限與歷史帳務：\n\n" + path
+                        + "\n\n💡 此檔案可直接匯入新平板或未來升級匯入 SaaS 總部平台，達到無痛資料轉移。")
+                    .setPositiveButton("好", null)
+                    .show();
+            }
+        });
+        LinearLayout.LayoutParams lpEx = new LinearLayout.LayoutParams(0, dp(36), 1f);
+        lpEx.rightMargin = dp(6);
+        brandBtnRow.addView(btnExportLocalSnap, lpEx);
+
+        Button btnImportLocalSnap = new Button(this);
+        btnImportLocalSnap.setText("📥 從本機快照匯入/回復");
+        btnImportLocalSnap.setAllCaps(false);
+        btnImportLocalSnap.setTextSize(12);
+        btnImportLocalSnap.setTextColor(Color.WHITE);
+        btnImportLocalSnap.setBackground(roundBg(Color.parseColor("#B45309"), 0, 0, 6));
+        btnImportLocalSnap.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { showLocalSnapshotImportDialog(); }
+        });
+        brandBtnRow.addView(btnImportLocalSnap, new LinearLayout.LayoutParams(0, dp(36), 1f));
+        brandPanel.addView(brandBtnRow);
+        box.addView(brandPanel);
 
         // 1. 出單機 HPRT TP805L 設定、字體大小調整與防邊緣裁切設定
         addSectionHeader(box, "🧾 1. 出單機設定 (HPRT TP805L - 字體大小、紙寬與防邊緣裁切設定)");
@@ -3948,6 +4293,7 @@ public class MainActivity extends Activity {
                         if (ok && downloaded != null && !downloaded.isEmpty()) {
                             menuItems.clear();
                             menuItems.addAll(downloaded);
+                            rebuildMealDrinkPool();
                             dbHelper.saveMenuList(menuItems);
                             refreshAllPosViews();
                             rebuildSettingsTab();
@@ -4076,14 +4422,151 @@ public class MainActivity extends Activity {
         otaRow.addView(btnTechLogs, new LinearLayout.LayoutParams(dp(95), dp(38)));
         box.addView(otaRow);
 
-        // 4. 平板本地菜單新增 / 改價 / 還原管理
+        // 3C. 彈性員工權限、交班盤點與操作稽核設定 (可依 1~3 人小店 vs 多人門市自行決定細度)
+        addSectionHeader(box, "👥 3C. 員工權限分級、交班盤點與稽核日誌（可自由決定管理細度）");
+        LinearLayout staffPanel = new LinearLayout(this);
+        staffPanel.setOrientation(LinearLayout.VERTICAL);
+        staffPanel.setBackground(roundBg(Color.parseColor("#1E293B"), Color.parseColor("#475569"), 1, 8));
+        staffPanel.setPadding(dp(10), dp(8), dp(10), dp(8));
+
+        LinearLayout toggleRow = new LinearLayout(this);
+        toggleRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button btnToggleStaffMode = new Button(this);
+        btnToggleStaffMode.setText(staffModeEnabled ? "✅ 人員切換：多員工分權" : "🟢 人員切換：極簡共用 (免切換)");
+        btnToggleStaffMode.setAllCaps(false);
+        btnToggleStaffMode.setTextSize(11);
+        btnToggleStaffMode.setTextColor(staffModeEnabled ? Color.parseColor("#052E16") : Color.WHITE);
+        btnToggleStaffMode.setBackground(roundBg(
+            staffModeEnabled ? Color.parseColor("#38BDF8") : Color.parseColor("#334155"), 0, 0, 6));
+        btnToggleStaffMode.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                staffModeEnabled = !staffModeEnabled;
+                dbHelper.setSetting("staff_mode_enabled", staffModeEnabled ? "1" : "0");
+                if (staffModeEnabled) {
+                    dbHelper.seedDefaultStaffIfEmpty(managerPin);
+                    staffMembers.clear();
+                    staffMembers.addAll(dbHelper.loadStaffMembers());
+                }
+                updateBrandAndStaffHeader();
+                rebuildSettingsTab();
+            }
+        });
+        LinearLayout.LayoutParams lpSm = new LinearLayout.LayoutParams(0, dp(36), 1f);
+        lpSm.rightMargin = dp(6);
+        toggleRow.addView(btnToggleStaffMode, lpSm);
+
+        Button btnToggleHandover = new Button(this);
+        btnToggleHandover.setText(shiftHandoverEnabled ? "✅ 交班盤點：已啟用" : "⚪ 交班盤點：關閉 (僅日結)");
+        btnToggleHandover.setAllCaps(false);
+        btnToggleHandover.setTextSize(11);
+        btnToggleHandover.setTextColor(shiftHandoverEnabled ? Color.parseColor("#052E16") : Color.WHITE);
+        btnToggleHandover.setBackground(roundBg(
+            shiftHandoverEnabled ? Color.parseColor("#F59E0B") : Color.parseColor("#334155"), 0, 0, 6));
+        btnToggleHandover.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                shiftHandoverEnabled = !shiftHandoverEnabled;
+                dbHelper.setSetting("shift_handover_enabled", shiftHandoverEnabled ? "1" : "0");
+                rebuildClosingTab();
+                rebuildSettingsTab();
+            }
+        });
+        LinearLayout.LayoutParams lpHoSet = new LinearLayout.LayoutParams(0, dp(36), 1f);
+        lpHoSet.rightMargin = dp(6);
+        toggleRow.addView(btnToggleHandover, lpHoSet);
+
+        Button btnToggleAudit = new Button(this);
+        btnToggleAudit.setText(auditLogEnabled ? "✅ 操作稽核：已啟用" : "⚪ 操作稽核：關閉");
+        btnToggleAudit.setAllCaps(false);
+        btnToggleAudit.setTextSize(11);
+        btnToggleAudit.setTextColor(auditLogEnabled ? Color.parseColor("#052E16") : Color.WHITE);
+        btnToggleAudit.setBackground(roundBg(
+            auditLogEnabled ? Color.parseColor("#34D399") : Color.parseColor("#334155"), 0, 0, 6));
+        btnToggleAudit.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                auditLogEnabled = !auditLogEnabled;
+                dbHelper.setSetting("audit_log_enabled", auditLogEnabled ? "1" : "0");
+                rebuildClosingTab();
+                rebuildSettingsTab();
+            }
+        });
+        toggleRow.addView(btnToggleAudit, new LinearLayout.LayoutParams(0, dp(36), 1f));
+        staffPanel.addView(toggleRow);
+
+        TextView tvStaffHint = new TextView(this);
+        tvStaffHint.setText("💡 1~3 人小店可維持「極簡共用」零負擔；多員工門市可自由開啟人員切換、交班對帳與退單/折扣稽核。");
+        tvStaffHint.setTextColor(Color.parseColor("#94A3B8"));
+        tvStaffHint.setTextSize(11);
+        tvStaffHint.setPadding(0, dp(6), 0, dp(4));
+        staffPanel.addView(tvStaffHint);
+
+        if (staffModeEnabled) {
+            LinearLayout staffHdr = new LinearLayout(this);
+            staffHdr.setOrientation(LinearLayout.HORIZONTAL);
+            staffHdr.setGravity(Gravity.CENTER_VERTICAL);
+            TextView tvSl = new TextView(this);
+            tvSl.setText("目前員工名單（點擊切換或管理，PIN 留空可一鍵免密碼切換）：");
+            tvSl.setTextColor(Color.parseColor("#E0F2FE"));
+            tvSl.setTextSize(12);
+            staffHdr.addView(tvSl, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+            Button btnAddStaff = new Button(this);
+            btnAddStaff.setText("➕ 新增員工");
+            btnAddStaff.setAllCaps(false);
+            btnAddStaff.setTextSize(11);
+            btnAddStaff.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) { showEditStaffDialog(null); }
+            });
+            staffHdr.addView(btnAddStaff);
+            staffPanel.addView(staffHdr);
+
+            for (final StaffMember sm : staffMembers) {
+                LinearLayout sRow = new LinearLayout(this);
+                sRow.setOrientation(LinearLayout.HORIZONTAL);
+                sRow.setGravity(Gravity.CENTER_VERTICAL);
+                sRow.setPadding(dp(4), dp(2), dp(4), dp(2));
+                TextView tvS = new TextView(this);
+                tvS.setText("• " + sm.name + " [" + sm.role + "] " + (sm.pin.isEmpty() ? "(免PIN)" : "(🔐PIN保護)"));
+                tvS.setTextColor(Color.WHITE);
+                tvS.setTextSize(12);
+                sRow.addView(tvS, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                Button bEditS = new Button(this);
+                bEditS.setText("✏️ 編輯");
+                bEditS.setAllCaps(false);
+                bEditS.setTextSize(11);
+                bEditS.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View v) { showEditStaffDialog(sm); }
+                });
+                sRow.addView(bEditS);
+
+                if (staffMembers.size() > 1) {
+                    Button bDelS = new Button(this);
+                    bDelS.setText("🗑️");
+                    bDelS.setAllCaps(false);
+                    bDelS.setTextSize(11);
+                    bDelS.setOnClickListener(new View.OnClickListener() {
+                        @Override public void onClick(View v) {
+                            dbHelper.deleteStaffMember(sm.id);
+                            staffMembers.remove(sm);
+                            rebuildSettingsTab();
+                        }
+                    });
+                    sRow.addView(bDelS);
+                }
+                staffPanel.addView(sRow);
+            }
+        }
+        box.addView(staffPanel);
+
+        // 4. 平板本地菜單新增 / 改價 / 範本 / 清空管理
         LinearLayout menuHeaderRow = new LinearLayout(this);
         menuHeaderRow.setOrientation(LinearLayout.HORIZONTAL);
         menuHeaderRow.setGravity(Gravity.CENTER_VERTICAL);
         menuHeaderRow.setPadding(0, dp(10), 0, dp(4));
 
         TextView tvMenuTitle = new TextView(this);
-        tvMenuTitle.setText("🌿 4. 伊凡的花園 — 菜單管理 (共 " + menuItems.size() + " 項，點擊可改價或新增)");
+        tvMenuTitle.setText("📋 4. 【" + PosPrintEngine.getEffectiveShortName() + "】菜單管理 (共 " + menuItems.size() + " 項)");
         tvMenuTitle.setTextColor(Color.parseColor("#A7F3D0"));
         tvMenuTitle.setTextSize(13);
         tvMenuTitle.setTypeface(null, Typeface.BOLD);
@@ -4099,19 +4582,53 @@ public class MainActivity extends Activity {
         menuHeaderRow.addView(btnAddMenu);
 
         Button btnResetMenu = new Button(this);
-        btnResetMenu.setText("🔄 還原預設66道菜單");
+        btnResetMenu.setText("📥 匯入示範菜單(66道)");
         btnResetMenu.setAllCaps(false);
         btnResetMenu.setTextSize(12);
         btnResetMenu.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
-                initMenuData();
-                dbHelper.saveMenuList(menuItems);
-                refreshAllPosViews();
-                rebuildSettingsTab();
-                Toast.makeText(MainActivity.this, "✅ 已還原伊凡的花園完整 66 道預設菜單", Toast.LENGTH_SHORT).show();
+                new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("📥 匯入茶飲簡餐示範菜單 (66道)")
+                    .setMessage("這會以內建的「茶飲簡餐 66 道示範菜單」覆蓋目前菜單（方便新店測試或快速修改）。確定要匯入嗎？")
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("確定匯入", new DialogInterface.OnClickListener() {
+                        @Override public void onClick(DialogInterface d, int w) {
+                            initMenuData();
+                            dbHelper.saveMenuList(menuItems);
+                            refreshAllPosViews();
+                            rebuildSettingsTab();
+                            Toast.makeText(MainActivity.this, "✅ 已匯入 66 道示範菜單", Toast.LENGTH_SHORT).show();
+                        }
+                    })
+                    .show();
             }
         });
         menuHeaderRow.addView(btnResetMenu);
+
+        Button btnClearMenu = new Button(this);
+        btnClearMenu.setText("🧹 清空菜單");
+        btnClearMenu.setAllCaps(false);
+        btnClearMenu.setTextSize(12);
+        btnClearMenu.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("🧹 確定要清空所有菜單品項？")
+                    .setMessage("清空後可透過「➕ 新增品項」或試算表下載來建立貴店專屬菜單（不影響歷史帳務）。")
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("確定清空", new DialogInterface.OnClickListener() {
+                        @Override public void onClick(DialogInterface d, int w) {
+                            menuItems.clear();
+                            rebuildMealDrinkPool();
+                            dbHelper.saveMenuList(menuItems);
+                            refreshAllPosViews();
+                            rebuildSettingsTab();
+                            Toast.makeText(MainActivity.this, "🧹 已清空菜單", Toast.LENGTH_SHORT).show();
+                        }
+                    })
+                    .show();
+            }
+        });
+        menuHeaderRow.addView(btnClearMenu);
         box.addView(menuHeaderRow);
 
         for (int i = 0; i < menuItems.size(); i++) {
@@ -4145,6 +4662,7 @@ public class MainActivity extends Activity {
                 @Override public void onClick(View v) {
                     dbHelper.deleteMenuItem(m.id);
                     menuItems.remove(m);
+                    rebuildMealDrinkPool();
                     refreshAllPosViews();
                     rebuildSettingsTab();
                 }
@@ -4212,7 +4730,11 @@ public class MainActivity extends Activity {
                         existing.hasFreeTea = cbFreeTea.isChecked();
                         dbHelper.upsertMenuItem(existing);
                     } else {
-                        int nextId = 9000 + menuItems.size() + 1;
+                        int maxId = 9000;
+                        for (MenuItem mm : menuItems) {
+                            if (mm.id >= maxId) maxId = mm.id;
+                        }
+                        int nextId = maxId + 1;
                         MenuItem created = new MenuItem(
                             nextId, cat, name, sub, price,
                             cbIsDrink.isChecked(), cbFreeTea.isChecked(),
@@ -4222,6 +4744,7 @@ public class MainActivity extends Activity {
                         menuItems.add(created);
                         dbHelper.upsertMenuItem(created);
                     }
+                    rebuildMealDrinkPool();
                     refreshAllPosViews();
                     rebuildSettingsTab();
                 }
@@ -4465,21 +4988,45 @@ public class MainActivity extends Activity {
             });
     }
 
-    private void requireManagerPinIfSet(String actionTitle, final Runnable onAuthorized) {
-        if (managerPin == null || managerPin.trim().isEmpty()) {
+    private void authorizeAction(String actionTitle, boolean requireManagerRole, final Runnable onAuthorized) {
+        boolean needManagerPin = false;
+        if (managerPin != null && !managerPin.trim().isEmpty()) {
+            if (!staffModeEnabled || requireManagerRole || !"店長".equals(currentStaffRole)) {
+                needManagerPin = true;
+            }
+        } else if (staffModeEnabled && requireManagerRole && !"店長".equals(currentStaffRole)) {
+            // 若未設定全域 managerPin，檢查是否有設定「店長」角色的個人 PIN
+            for (StaffMember sm : staffMembers) {
+                if ("店長".equals(sm.role) && sm.pin != null && !sm.pin.trim().isEmpty()) {
+                    needManagerPin = true;
+                    break;
+                }
+            }
+        }
+        if (!needManagerPin) {
             onAuthorized.run();
             return;
         }
         final EditText et = new EditText(this);
         et.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
-        et.setHint("請輸入 4 位數店長 PIN 碼");
+        et.setHint("請輸入店長 PIN 碼");
         new AlertDialog.Builder(this)
-            .setTitle("🔐 店長權限驗證：" + actionTitle)
+            .setTitle("🔐 權限驗證：" + actionTitle)
             .setView(et)
             .setNegativeButton("取消", null)
             .setPositiveButton("確認", new DialogInterface.OnClickListener() {
                 @Override public void onClick(DialogInterface d, int w) {
-                    if (managerPin.equals(et.getText().toString().trim())) {
+                    String entered = et.getText().toString().trim();
+                    boolean ok = (!managerPin.trim().isEmpty() && managerPin.equals(entered));
+                    if (!ok && staffModeEnabled) {
+                        for (StaffMember sm : staffMembers) {
+                            if ("店長".equals(sm.role) && !sm.pin.trim().isEmpty() && sm.pin.equals(entered)) {
+                                ok = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (ok) {
                         onAuthorized.run();
                     } else {
                         Toast.makeText(MainActivity.this, "❌ PIN 碼錯誤！", Toast.LENGTH_SHORT).show();
@@ -4487,6 +5034,378 @@ public class MainActivity extends Activity {
                 }
             })
             .show();
+    }
+
+    private void showSwitchStaffDialog() {
+        if (staffMembers.isEmpty()) {
+            dbHelper.seedDefaultStaffIfEmpty(managerPin);
+            staffMembers.clear();
+            staffMembers.addAll(dbHelper.loadStaffMembers());
+        }
+        String[] labels = new String[staffMembers.size()];
+        for (int i = 0; i < staffMembers.size(); i++) {
+            StaffMember s = staffMembers.get(i);
+            String mark = s.name.equals(currentStaffName) ? "✔ " : "";
+            labels[i] = mark + s.name + " [" + s.role + "]" + (s.pin.isEmpty() ? "" : " 🔐");
+        }
+        new AlertDialog.Builder(this)
+            .setTitle("👤 切換當班操作人員")
+            .setItems(labels, new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int which) {
+                    final StaffMember target = staffMembers.get(which);
+                    if (target.pin == null || target.pin.trim().isEmpty()) {
+                        applyActiveStaff(target);
+                        return;
+                    }
+                    final EditText et = new EditText(MainActivity.this);
+                    et.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+                    et.setHint("請輸入 " + target.name + " 的 PIN 碼");
+                    new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("🔐 登入驗證：" + target.name)
+                        .setView(et)
+                        .setNegativeButton("取消", null)
+                        .setPositiveButton("登入", new DialogInterface.OnClickListener() {
+                            @Override public void onClick(DialogInterface d2, int w2) {
+                                if (target.pin.equals(et.getText().toString().trim())) {
+                                    applyActiveStaff(target);
+                                } else {
+                                    Toast.makeText(MainActivity.this, "❌ PIN 碼錯誤", Toast.LENGTH_SHORT).show();
+                                }
+                            }
+                        })
+                        .show();
+                }
+            })
+            .setNegativeButton("取消", null)
+            .show();
+    }
+
+    private void applyActiveStaff(StaffMember target) {
+        currentStaffName = target.name;
+        currentStaffRole = target.role;
+        dbHelper.setSetting("current_staff_name", currentStaffName);
+        dbHelper.setSetting("current_staff_role", currentStaffRole);
+        if (auditLogEnabled) {
+            dbHelper.insertAuditLog(currentStaffName, "STAFF_SWITCH", currentStaffRole, "切換當班人員");
+        }
+        updateBrandAndStaffHeader();
+        if (viewClosing.getVisibility() == View.VISIBLE) rebuildClosingTab();
+        Toast.makeText(this, "👤 目前當班人員：" + currentStaffName + " (" + currentStaffRole + ")", Toast.LENGTH_SHORT).show();
+    }
+
+    private void showEditStaffDialog(final StaffMember existing) {
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(16), dp(12), dp(16), dp(12));
+
+        final EditText etName = new EditText(this);
+        etName.setHint("姓名 / 稱呼 (如：小美、晚班人員)");
+        etName.setText(existing != null ? existing.name : "");
+        form.addView(etName);
+
+        final String[] roles = {"店員", "店長"};
+        final String[] selRole = {existing != null ? existing.role : "店員"};
+        final Button btnRole = new Button(this);
+        btnRole.setText("角色權限：" + selRole[0] + " (點擊切換)");
+        btnRole.setAllCaps(false);
+        btnRole.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                selRole[0] = "店長".equals(selRole[0]) ? "店員" : "店長";
+                btnRole.setText("角色權限：" + selRole[0] + " (點擊切換)");
+            }
+        });
+        form.addView(btnRole);
+
+        final EditText etPin = new EditText(this);
+        etPin.setInputType(InputType.TYPE_CLASS_NUMBER);
+        etPin.setHint("PIN 碼 (留空表示免密碼一鍵切換)");
+        etPin.setText(existing != null ? existing.pin : "");
+        form.addView(etPin);
+
+        new AlertDialog.Builder(this)
+            .setTitle(existing != null ? "✏️ 編輯員工資料" : "➕ 新增員工")
+            .setView(form)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("儲存", new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int w) {
+                    String name = etName.getText().toString().trim();
+                    if (name.isEmpty()) return;
+                    StaffMember sm = (existing != null) ? existing : new StaffMember();
+                    sm.name = name;
+                    sm.role = selRole[0];
+                    sm.pin = etPin.getText().toString().trim();
+                    sm.enabled = true;
+                    dbHelper.upsertStaffMember(sm);
+                    staffMembers.clear();
+                    staffMembers.addAll(dbHelper.loadStaffMembers());
+                    rebuildSettingsTab();
+                }
+            })
+            .show();
+    }
+
+    private void showShiftHandoverDialog() {
+        int orderCnt = 0, voidCnt = 0, cashSum = 0, nonCashSum = 0;
+        long maxDbId = lastHandoverOrderDbId;
+        for (OrderRecord o : ordersHistory) {
+            if (o.dbId > lastHandoverOrderDbId || o.dbId <= 0) {
+                if (o.dbId > maxDbId) maxDbId = o.dbId;
+                if (o.voided) {
+                    voidCnt++;
+                } else {
+                    orderCnt++;
+                    if ("現金".equals(o.paymentMethod)) cashSum += o.total;
+                    else nonCashSum += o.total;
+                }
+            }
+        }
+        final long fMaxId = maxDbId;
+        final int fOrderCnt = orderCnt;
+        final int fVoidCnt = voidCnt;
+        final int fCashSum = cashSum;
+        final int fNonCashSum = nonCashSum;
+        final int expectedCash = openingFloat + cashSum;
+        final String nowTime = new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.TAIWAN).format(new Date());
+
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(16), dp(12), dp(16), dp(12));
+
+        TextView tvSummary = new TextView(this);
+        tvSummary.setText("• 交班人員：" + (staffModeEnabled ? currentStaffName : "當班人員")
+            + "\n• 開班時間：" + shiftStartTime + " ～ " + nowTime
+            + "\n• 本班有效單：" + fOrderCnt + " 筆 ｜ 作廢：" + fVoidCnt + " 筆"
+            + "\n• 本班現金收入：$" + fCashSum + " ＋ 期初零用金：$" + openingFloat
+            + "\n• 本班非現金收入：$" + fNonCashSum
+            + "\n👉 錢櫃應有總現金：$" + expectedCash);
+        tvSummary.setTextSize(14);
+        tvSummary.setPadding(0, 0, 0, dp(10));
+        form.addView(tvSummary);
+
+        final EditText etCounted = new EditText(this);
+        etCounted.setInputType(InputType.TYPE_CLASS_NUMBER);
+        etCounted.setHint("請輸入錢櫃實點現金總額 ($)");
+        etCounted.setText(String.valueOf(expectedCash));
+        form.addView(etCounted);
+
+        final EditText etNote = new EditText(this);
+        etNote.setHint("交班備註 (可留空，如短差原因或交接事項)");
+        form.addView(etNote);
+
+        final CheckBox cbPrint = new CheckBox(this);
+        cbPrint.setText("🖨️ 用收據機印出交班對帳單");
+        cbPrint.setChecked(true);
+        form.addView(cbPrint);
+
+        new AlertDialog.Builder(this)
+            .setTitle("🤝 班別交班現金盤點結算")
+            .setView(form)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("✅ 確認交班", new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int w) {
+                    int counted = expectedCash;
+                    try { counted = Integer.parseInt(etCounted.getText().toString().trim()); } catch (Exception ignored) {}
+                    ShiftHandoverRecord sh = new ShiftHandoverRecord();
+                    sh.shiftStart = shiftStartTime;
+                    sh.shiftEnd = nowTime;
+                    sh.staffName = staffModeEnabled ? currentStaffName : "當班人員";
+                    sh.openingCash = openingFloat;
+                    sh.cashSales = fCashSum;
+                    sh.nonCashSales = fNonCashSum;
+                    sh.expectedCash = expectedCash;
+                    sh.countedCash = counted;
+                    sh.diffCash = counted - expectedCash;
+                    sh.orderCount = fOrderCnt;
+                    sh.voidCount = fVoidCnt;
+                    sh.note = etNote.getText().toString().trim();
+
+                    dbHelper.insertShiftHandover(sh);
+                    lastHandoverOrderDbId = fMaxId;
+                    shiftStartTime = nowTime;
+                    dbHelper.setSetting("last_handover_order_id", String.valueOf(lastHandoverOrderDbId));
+                    dbHelper.setSetting("shift_start_time", shiftStartTime);
+
+                    if (auditLogEnabled || staffModeEnabled) {
+                        dbHelper.insertAuditLog(sh.staffName, "SHIFT_CLOSE", nowTime,
+                            "交班應有 $" + expectedCash + " / 實點 $" + counted + " (差 $" + sh.diffCash + ")");
+                    }
+                    if (cbPrint.isChecked()) {
+                        PosPrintEngine.printShiftHandoverAsync(sh, receiptIp, receiptPort, receiptWidthMm,
+                            new PosPrintEngine.PrintCallback() {
+                                @Override public void onComplete(boolean ok, String msg) {
+                                    Toast.makeText(MainActivity.this, msg, Toast.LENGTH_SHORT).show();
+                                }
+                            });
+                    }
+                    rebuildClosingTab();
+                    Toast.makeText(MainActivity.this,
+                        "🤝 交班完成！實點 $" + counted + " (溢/短差 $" + sh.diffCash + ")",
+                        Toast.LENGTH_LONG).show();
+                }
+            })
+            .show();
+    }
+
+    private void showShiftAndAuditLogsDialog() {
+        List<ShiftHandoverRecord> shifts = dbHelper.loadShiftHandovers(30);
+        List<AuditLogRecord> audits = dbHelper.loadAuditLogs(50);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("================ 【近期班別交班盤點紀錄】 ================\n");
+        if (shifts.isEmpty()) {
+            sb.append("  (尚無交班紀錄)\n");
+        } else {
+            for (ShiftHandoverRecord sh : shifts) {
+                String diffPrefix = sh.diffCash > 0 ? "+" : "";
+                sb.append("• ").append(sh.shiftEnd).append(" 👤").append(sh.staffName)
+                  .append("\n  本班 ").append(sh.orderCount).append(" 單｜現金 $").append(sh.cashSales)
+                  .append("｜應有 $").append(sh.expectedCash).append("｜實點 $").append(sh.countedCash)
+                  .append(" (差 ").append(diffPrefix).append("$").append(sh.diffCash).append(")");
+                if (sh.note != null && !sh.note.isEmpty()) sb.append("｜備註:").append(sh.note);
+                sb.append("\n");
+            }
+        }
+        sb.append("\n================ 【敏感操作稽核日誌 (作廢/折扣/交班/切換)】 ================\n");
+        if (audits.isEmpty()) {
+            sb.append("  (尚無稽核紀錄)\n");
+        } else {
+            for (AuditLogRecord al : audits) {
+                sb.append("[").append(al.createdAt).append("] 👤").append(al.staffName)
+                  .append("｜").append(al.actionType).append(" ").append(al.targetRef)
+                  .append(" ➔ ").append(al.detail).append("\n");
+            }
+        }
+
+        ScrollView sv = new ScrollView(this);
+        TextView tv = new TextView(this);
+        tv.setText(sb.toString());
+        tv.setTextColor(Color.WHITE);
+        tv.setTextSize(12);
+        tv.setPadding(dp(14), dp(10), dp(14), dp(10));
+        tv.setBackgroundColor(Color.parseColor("#0F172A"));
+        sv.addView(tv);
+        new AlertDialog.Builder(this)
+            .setTitle("📜 交班盤點與敏感操作稽核日誌")
+            .setView(sv)
+            .setPositiveButton("關閉", null)
+            .show();
+    }
+
+    private void showLocalSnapshotImportDialog() {
+        final List<java.io.File> files = dbHelper.listLocalSnapshotFiles();
+        if (files.isEmpty()) {
+            new AlertDialog.Builder(this)
+                .setTitle("📥 找不到本機遷移快照檔")
+                .setMessage("請先將 .json 快照檔放入平板的 Download/POS_Reports/ 資料夾，或先點「📤 匯出遷移快照 (.json)」。")
+                .setPositiveButton("好", null)
+                .show();
+            return;
+        }
+        String[] names = new String[files.size()];
+        for (int i = 0; i < files.size(); i++) {
+            names[i] = files.get(i).getName() + " (" + (files.get(i).length() / 1024) + " KB)";
+        }
+        new AlertDialog.Builder(this)
+            .setTitle("📥 選擇要匯入還原的系統快照檔 (.json)：")
+            .setItems(names, new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, final int which) {
+                    final java.io.File chosen = files.get(which);
+                    new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("♻️ 確認從本機快照匯入？")
+                        .setMessage("將從【" + chosen.getName() + "】還原門市設定、完整菜單、桌位、員工與歷史帳務，覆蓋目前本機資料。\n確定執行嗎？")
+                        .setNegativeButton("取消", null)
+                        .setPositiveButton("立即匯入還原", new DialogInterface.OnClickListener() {
+                            @Override public void onClick(DialogInterface d2, int w2) {
+                                try {
+                                    org.json.JSONObject snap = dbHelper.readSnapshotFromFile(chosen);
+                                    String summary = dbHelper.restoreFromSnapshotJson(snap);
+                                    loadDatabaseState();
+                                    updateBrandAndStaffHeader();
+                                    refreshAllPosViews();
+                                    refreshPrinterStatusBadge();
+                                    rebuildSettingsTab();
+                                    new AlertDialog.Builder(MainActivity.this)
+                                        .setTitle("✅ 本機快照無痛匯入完成！")
+                                        .setMessage("已成功還原：\n" + summary)
+                                        .setPositiveButton("太棒了", null)
+                                        .show();
+                                } catch (Exception e) {
+                                    Toast.makeText(MainActivity.this, "❌ 匯入失敗：" + e.getMessage(), Toast.LENGTH_LONG).show();
+                                }
+                            }
+                        })
+                        .show();
+                }
+            })
+            .setNegativeButton("取消", null)
+            .show();
+    }
+
+    private void showStoreOnboardingDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(12), dp(16), dp(12));
+
+        TextView tvIntro = new TextView(this);
+        tvIntro.setText("歡迎使用智慧餐飲 POS！請先輸入貴店名稱，並選擇初始化方式：");
+        tvIntro.setTextSize(14);
+        tvIntro.setPadding(0, 0, 0, dp(8));
+        box.addView(tvIntro);
+
+        final EditText etName = new EditText(this);
+        etName.setHint("完整店名 (如：晨光早午餐 / 好茶飲)");
+        box.addView(etName);
+
+        final EditText etShort = new EditText(this);
+        etShort.setHint("門市簡稱 (顯示於頂部與貼紙，可留空自動取店名)");
+        box.addView(etShort);
+
+        final EditText etSub = new EditText(this);
+        etSub.setHint("地址與電話 (印於收據抬頭第二行，可留空)");
+        box.addView(etSub);
+
+        new AlertDialog.Builder(this)
+            .setTitle("🏪 新門市快速開通精靈")
+            .setView(box)
+            .setCancelable(true)
+            .setPositiveButton("📋 套用66道示範菜單試用", new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int w) {
+                    applyOnboardingBrand(etName.getText().toString().trim(),
+                        etShort.getText().toString().trim(), etSub.getText().toString().trim());
+                    initMenuData();
+                    dbHelper.saveMenuList(menuItems);
+                    refreshAllPosViews();
+                    Toast.makeText(MainActivity.this, "✅ 已開通門市並載入 66 道示範菜單", Toast.LENGTH_SHORT).show();
+                }
+            })
+            .setNeutralButton("🧹 空白門市開始 (自行建單)", new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int w) {
+                    applyOnboardingBrand(etName.getText().toString().trim(),
+                        etShort.getText().toString().trim(), etSub.getText().toString().trim());
+                    switchMainTab(3);
+                }
+            })
+            .setNegativeButton("📥 從本機快照匯入", new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int w) {
+                    dbHelper.setSetting("store_initialized", "1");
+                    showLocalSnapshotImportDialog();
+                }
+            })
+            .show();
+    }
+
+    private void applyOnboardingBrand(String sn, String ss, String sub) {
+        if (sn.isEmpty()) sn = "我的餐飲門市";
+        if (ss.isEmpty()) ss = sn;
+        PosPrintEngine.storeName = sn;
+        PosPrintEngine.storeShortName = ss;
+        PosPrintEngine.storeSubtitle = sub;
+        dbHelper.setSetting("store_name", sn);
+        dbHelper.setSetting("store_short_name", ss);
+        dbHelper.setSetting("store_subtitle", sub);
+        dbHelper.setSetting("store_initialized", "1");
+        updateBrandAndStaffHeader();
+        refreshCartUI();
     }
 
     private void showSetManagerPinDialog() {
@@ -4584,7 +5503,7 @@ public class MainActivity extends Activity {
     private void triggerCloudRestore() {
         new AlertDialog.Builder(this)
             .setTitle("♻️ 確認從店家 Google 雲端硬碟一鍵回復？")
-            .setMessage("此操作將從雲端【伊凡的花園_POS營業備份】資料夾讀取最新備份檔，並覆寫本機的：\n• 菜單品項與價格\n• 視覺化桌位排列\n• 雙印表機 IP 與版面微調參數\n• 歷史日結關帳紀錄\n\n確定要立即還原嗎？")
+            .setMessage("此操作將從雲端【" + PosPrintEngine.getBackupFolderName() + "】資料夾讀取最新備份檔，並覆寫本機的：\n• 門市品牌與設定\n• 菜單品項與價格\n• 視覺化桌位排列\n• 員工權限與歷史關帳紀錄\n\n確定要立即還原嗎？")
             .setNegativeButton("取消", null)
             .setPositiveButton("立即一鍵還原", new DialogInterface.OnClickListener() {
                 @Override public void onClick(DialogInterface d, int w) {
@@ -4602,6 +5521,7 @@ public class MainActivity extends Activity {
                             try {
                                 String summary = dbHelper.restoreFromSnapshotJson(snapshot);
                                 loadDatabaseState();
+                                updateBrandAndStaffHeader();
                                 refreshAllPosViews();
                                 refreshPrinterStatusBadge();
                                 rebuildSettingsTab();
@@ -4680,7 +5600,7 @@ public class MainActivity extends Activity {
                     } catch (Exception e) {
                         new AlertDialog.Builder(MainActivity.this)
                             .setTitle("⚠️ 請允許安裝未知應用程式")
-                            .setMessage("請至平板「設定 ➔ 應用程式 ➔ 伊凡的花園 POS ➔ 安裝未知應用程式」開啟允許後，再點一次更新。\n錯誤：" + e.getMessage())
+                            .setMessage("請至平板「設定 ➔ 應用程式 ➔ 智慧餐飲 POS ➔ 安裝未知應用程式」開啟允許後，再點一次更新。\n錯誤：" + e.getMessage())
                             .setPositiveButton("確定", null)
                             .show();
                     }

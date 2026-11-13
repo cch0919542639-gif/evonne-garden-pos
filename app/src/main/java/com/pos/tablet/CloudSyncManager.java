@@ -123,7 +123,9 @@ public class CloudSyncManager {
                 try {
                     JSONObject root = new JSONObject();
                     root.put("action", "upload_closing");
-                    root.put("storeName", "伊凡的花園 Evonne's Garden");
+                    root.put("storeCode", PosPrintEngine.storeCode);
+                    root.put("storeName", PosPrintEngine.storeName);
+                    root.put("storeShortName", PosPrintEngine.getEffectiveShortName());
                     root.put("closeTime", cr.time);
                     root.put("validCount", cr.validCount);
                     root.put("voidCount", cr.voidCount);
@@ -185,6 +187,10 @@ public class CloudSyncManager {
                 try {
                     JSONObject root = new JSONObject();
                     root.put("action", "upload_menu");
+                    root.put("storeCode", PosPrintEngine.storeCode);
+                    root.put("storeName", PosPrintEngine.storeName);
+                    root.put("storeShortName", PosPrintEngine.getEffectiveShortName());
+                    root.put("storeSubtitle", PosPrintEngine.storeSubtitle);
                     JSONArray arr = new JSONArray();
                     for (MainActivity.MenuItem m : menuList) {
                         JSONObject o = new JSONObject();
@@ -462,14 +468,19 @@ public class CloudSyncManager {
         EXECUTOR.execute(new Runnable() {
             @Override public void run() {
                 try {
+                    final String expectedFolder = PosPrintEngine.getBackupFolderName();
                     JSONObject req = new JSONObject();
                     req.put("action", "backup_full_snapshot");
+                    req.put("storeCode", PosPrintEngine.storeCode);
+                    req.put("storeName", PosPrintEngine.storeName);
+                    req.put("storeShortName", PosPrintEngine.getEffectiveShortName());
+                    req.put("folderName", expectedFolder);
                     req.put("snapshot", snapshotJson);
                     String resp = postJsonFollowRedirects(webAppUrl.trim(), req.toString());
                     JSONObject jo = new JSONObject(resp);
                     if ("ok".equals(jo.optString("status"))) {
                         postResult(callback, true, "✅ 已完整備份至店家 Google 雲端硬碟【"
-                            + jo.optString("folderName", "伊凡的花園_POS營業備份") + "】！\n檔案："
+                            + jo.optString("folderName", expectedFolder) + "】！\n檔案："
                             + jo.optString("fileName", "POS_完整備份.json"));
                     } else {
                         postResult(callback, false, "⚠️ 雲端備份回應異常：" + resp);
@@ -497,6 +508,7 @@ public class CloudSyncManager {
                 try {
                     JSONObject req = new JSONObject();
                     req.put("action", "restore_latest_snapshot");
+                    req.put("folderName", PosPrintEngine.getBackupFolderName());
                     String resp = postJsonFollowRedirects(webAppUrl.trim(), req.toString());
                     final JSONObject jo = new JSONObject(resp);
                     if (!"ok".equals(jo.optString("status")) || jo.optJSONObject("snapshot") == null) {
