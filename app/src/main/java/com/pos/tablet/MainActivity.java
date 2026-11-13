@@ -252,6 +252,10 @@ public class MainActivity extends Activity {
     private int labelPort = 9100;
     private String labelProtocol = "EZPL"; // EZPL (GoDEX原生) or TSPL
     private String googleSheetUrl = "";
+    private static final String DEFAULT_OTA_MANIFEST_URL =
+        "https://raw.githubusercontent.com/cch0919542639-gif/evonne-garden-pos/main/version.json";
+    private String otaManifestUrl = DEFAULT_OTA_MANIFEST_URL;
+    private String managerPin = "";
 
     private final List<MenuItem> menuItems = new ArrayList<>();
     private final List<DrinkUpgradeOption> mealDrinkPool = new ArrayList<>();
@@ -298,7 +302,7 @@ public class MainActivity extends Activity {
     };
 
     // ==================== UI REFERENCES ====================
-    private TextView tvTopCallNum;
+    private TextView tvTopCallNum, tvPrinterStatusBadge;
     private Button btnTabPos, btnTabQrOrders, btnTabOrders, btnTabClosing, btnTabSettings;
     private LinearLayout viewPos, viewOrders, viewClosing, viewSettings;
 
@@ -343,6 +347,14 @@ public class MainActivity extends Activity {
         refreshAllPosViews();
         handleIncomingConfigIntent();
         startQrOrderAutoPoller();
+        refreshPrinterStatusBadge();
+        if (googleSheetUrl != null && !googleSheetUrl.trim().isEmpty()) {
+            CloudSyncManager.flushPendingSyncQueueAsync(googleSheetUrl, dbHelper, new CloudSyncManager.SyncCallback() {
+                @Override public void onResult(boolean ok, String msg) {
+                    if (ok) Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show();
+                }
+            });
+        }
     }
 
     private void startQrOrderAutoPoller() {
@@ -497,6 +509,8 @@ public class MainActivity extends Activity {
         PosPrintEngine.labelFontScalePercent = dbHelper.getIntSetting("label_font_scale", 115);
         PosPrintEngine.labelMarginDots = dbHelper.getIntSetting("label_margin_dots", 12);
         googleSheetUrl = dbHelper.getSetting("google_sheet_url", "");
+        otaManifestUrl = dbHelper.getSetting("ota_manifest_url", DEFAULT_OTA_MANIFEST_URL);
+        managerPin = dbHelper.getSetting("manager_pin", "");
         loadTableFloorSlotsFromDb();
 
         ordersHistory.clear();
@@ -686,6 +700,20 @@ public class MainActivity extends Activity {
         lpCall.leftMargin = dp(10);
         topBar.addView(tvTopCallNum, lpCall);
 
+        tvPrinterStatusBadge = new TextView(this);
+        tvPrinterStatusBadge.setText("⏳雙機偵測中");
+        tvPrinterStatusBadge.setTextColor(Color.WHITE);
+        tvPrinterStatusBadge.setTextSize(11);
+        tvPrinterStatusBadge.setBackground(roundBg(Color.parseColor("#1E293B"), Color.parseColor("#475569"), 1, 6));
+        tvPrinterStatusBadge.setPadding(dp(8), dp(4), dp(8), dp(4));
+        tvPrinterStatusBadge.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { showPrinterDiscoveryDialog(); }
+        });
+        LinearLayout.LayoutParams lpPrn = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lpPrn.leftMargin = dp(6);
+        topBar.addView(tvPrinterStatusBadge, lpPrn);
+
         View spacer = new View(this);
         topBar.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
 
@@ -702,7 +730,11 @@ public class MainActivity extends Activity {
             @Override public void onClick(View v) { switchMainTab(2); }
         });
         btnTabSettings = makeTopTabBtn("⚙️ 雙機與設定", false, new View.OnClickListener() {
-            @Override public void onClick(View v) { switchMainTab(3); }
+            @Override public void onClick(View v) {
+                requireManagerPinIfSet("進入雙機與系統設定", new Runnable() {
+                    @Override public void run() { switchMainTab(3); }
+                });
+            }
         });
 
         topBar.addView(btnTabPos);
@@ -3160,10 +3192,14 @@ public class MainActivity extends Activity {
                 btnVoid.setBackground(roundBg(Color.parseColor("#EF4444"), 0, 0, 6));
                 btnVoid.setOnClickListener(new View.OnClickListener() {
                     @Override public void onClick(View v) {
-                        o.voided = true;
-                        if (o.dbId > 0) dbHelper.markOrderVoided(o.dbId, true);
-                        updateOrdersBadge();
-                        rebuildOrdersTab();
+                        requireManagerPinIfSet("作廢退單 (" + o.callNum + ")", new Runnable() {
+                            @Override public void run() {
+                                o.voided = true;
+                                if (o.dbId > 0) dbHelper.markOrderVoided(o.dbId, true);
+                                updateOrdersBadge();
+                                rebuildOrdersTab();
+                            }
+                        });
                     }
                 });
                 LinearLayout.LayoutParams lpV = new LinearLayout.LayoutParams(
@@ -3312,9 +3348,9 @@ public class MainActivity extends Activity {
                         });
                 }
 
-                // 4. 同步上傳至 Google 試算表
+                // 4. 同步上傳至 Google 試算表 (若斷網自動存入待補傳佇列)
                 CloudSyncManager.uploadClosingAndOrdersAsync(
-                    googleSheetUrl, cr, batchOrders, byPay, itemRank,
+                    googleSheetUrl, cr, batchOrders, byPay, itemRank, dbHelper,
                     new CloudSyncManager.SyncCallback() {
                         @Override public void onResult(boolean success, String message) {
                             cr.cloudSynced = success;
@@ -3797,6 +3833,21 @@ public class MainActivity extends Activity {
         labRow.addView(btnTestLab);
         box.addView(labRow);
 
+        Button btnDiscoverPrinters = new Button(this);
+        btnDiscoverPrinters.setText("🔍 區網自動搜尋印表機 IP（不怕路由器重開機跳號）");
+        btnDiscoverPrinters.setAllCaps(false);
+        btnDiscoverPrinters.setTextSize(12);
+        btnDiscoverPrinters.setTypeface(null, Typeface.BOLD);
+        btnDiscoverPrinters.setTextColor(Color.WHITE);
+        btnDiscoverPrinters.setBackground(roundBg(Color.parseColor("#0284C7"), Color.parseColor("#38BDF8"), 1, 8));
+        btnDiscoverPrinters.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { showPrinterDiscoveryDialog(); }
+        });
+        LinearLayout.LayoutParams lpDiscPrn = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(38));
+        lpDiscPrn.topMargin = dp(6);
+        box.addView(btnDiscoverPrinters, lpDiscPrn);
+
         // 3. Google 試算表雲端設定與雙向同步
         addSectionHeader(box, "☁️ 3. Google 試算表 (Apps Script Web App) 雲端資料庫網址");
         final EditText etSheet = new EditText(this);
@@ -3930,6 +3981,100 @@ public class MainActivity extends Activity {
             ViewGroup.LayoutParams.MATCH_PARENT, dp(42));
         lpQrSet.topMargin = dp(8);
         box.addView(btnOpenQrCenterInSettings, lpQrSet);
+
+        // 3B. 店家私人 Google Drive 完整備份 / 一鍵回復系統 / 系統 OTA 更新 / 店長 PIN 碼
+        addSectionHeader(box, "🛡️ 3B. 店家雲端硬碟備份、一鍵回復系統、OTA 遠端更新與權限鎖");
+
+        LinearLayout drRow = new LinearLayout(this);
+        drRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button btnFullBackup = new Button(this);
+        btnFullBackup.setText("☁️ 完整備份至店家 Google 雲端硬碟");
+        btnFullBackup.setAllCaps(false);
+        btnFullBackup.setTextSize(12);
+        btnFullBackup.setTypeface(null, Typeface.BOLD);
+        btnFullBackup.setTextColor(Color.WHITE);
+        btnFullBackup.setBackground(roundBg(Color.parseColor("#0369A1"), 0, 0, 8));
+        btnFullBackup.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                googleSheetUrl = etSheet.getText().toString().trim();
+                dbHelper.setSetting("google_sheet_url", googleSheetUrl);
+                triggerCloudFullBackup();
+            }
+        });
+        LinearLayout.LayoutParams lpBk = new LinearLayout.LayoutParams(0, dp(40), 1f);
+        lpBk.rightMargin = dp(6);
+        drRow.addView(btnFullBackup, lpBk);
+
+        Button btnFullRestore = new Button(this);
+        btnFullRestore.setText("♻️ 從雲端一鍵回復系統 (換機用)");
+        btnFullRestore.setAllCaps(false);
+        btnFullRestore.setTextSize(12);
+        btnFullRestore.setTypeface(null, Typeface.BOLD);
+        btnFullRestore.setTextColor(Color.WHITE);
+        btnFullRestore.setBackground(roundBg(Color.parseColor("#B45309"), 0, 0, 8));
+        btnFullRestore.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                googleSheetUrl = etSheet.getText().toString().trim();
+                dbHelper.setSetting("google_sheet_url", googleSheetUrl);
+                triggerCloudRestore();
+            }
+        });
+        drRow.addView(btnFullRestore, new LinearLayout.LayoutParams(0, dp(40), 1f));
+        box.addView(drRow);
+
+        final EditText etOtaUrl = new EditText(this);
+        etOtaUrl.setHint("系統 OTA 更新清單網址 (version.json)");
+        etOtaUrl.setText(otaManifestUrl);
+        etOtaUrl.setTextColor(Color.parseColor("#CBD5E1"));
+        etOtaUrl.setTextSize(12);
+        box.addView(etOtaUrl);
+
+        LinearLayout otaRow = new LinearLayout(this);
+        otaRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button btnCheckOta = new Button(this);
+        btnCheckOta.setText("🔄 檢查系統遠端更新 (目前 v" + getAppVersionName() + ")");
+        btnCheckOta.setAllCaps(false);
+        btnCheckOta.setTextSize(12);
+        btnCheckOta.setTypeface(null, Typeface.BOLD);
+        btnCheckOta.setTextColor(Color.parseColor("#052E16"));
+        btnCheckOta.setBackground(roundBg(Color.parseColor("#34D399"), 0, 0, 8));
+        btnCheckOta.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                otaManifestUrl = etOtaUrl.getText().toString().trim();
+                dbHelper.setSetting("ota_manifest_url", otaManifestUrl);
+                showOtaUpdateDialog();
+            }
+        });
+        LinearLayout.LayoutParams lpOta = new LinearLayout.LayoutParams(0, dp(38), 1.3f);
+        lpOta.rightMargin = dp(6);
+        otaRow.addView(btnCheckOta, lpOta);
+
+        Button btnPinLock = new Button(this);
+        btnPinLock.setText(managerPin.isEmpty() ? "🔓 店長 PIN 碼：未啟用" : "🔐 店長 PIN 碼：已啟用");
+        btnPinLock.setAllCaps(false);
+        btnPinLock.setTextSize(12);
+        btnPinLock.setTextColor(Color.WHITE);
+        btnPinLock.setBackground(roundBg(Color.parseColor("#475569"), 0, 0, 8));
+        btnPinLock.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { showSetManagerPinDialog(); }
+        });
+        LinearLayout.LayoutParams lpPin = new LinearLayout.LayoutParams(0, dp(38), 1f);
+        lpPin.rightMargin = dp(6);
+        otaRow.addView(btnPinLock, lpPin);
+
+        Button btnTechLogs = new Button(this);
+        btnTechLogs.setText("🩺 技術日誌");
+        btnTechLogs.setAllCaps(false);
+        btnTechLogs.setTextSize(12);
+        btnTechLogs.setTextColor(Color.WHITE);
+        btnTechLogs.setBackground(roundBg(Color.parseColor("#334155"), 0, 0, 8));
+        btnTechLogs.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { showTechLogsDialog(); }
+        });
+        otaRow.addView(btnTechLogs, new LinearLayout.LayoutParams(dp(95), dp(38)));
+        box.addView(otaRow);
 
         // 4. 平板本地菜單新增 / 改價 / 還原管理
         LinearLayout menuHeaderRow = new LinearLayout(this);
@@ -4283,6 +4428,280 @@ public class MainActivity extends Activity {
                         });
                 }
             })
+            .setPositiveButton("關閉", null)
+            .show();
+    }
+
+    // ==================== 雙機連線燈號 / 區網尋回 / 店長PIN / 雲端備份回復 / OTA更新 ====================
+    private int getAppVersionCode() {
+        try {
+            android.content.pm.PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
+            return (int) (android.os.Build.VERSION.SDK_INT >= 28 ? pi.getLongVersionCode() : pi.versionCode);
+        } catch (Exception e) {
+            return 3;
+        }
+    }
+
+    private String getAppVersionName() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return "1.2";
+        }
+    }
+
+    private void refreshPrinterStatusBadge() {
+        if (tvPrinterStatusBadge == null) return;
+        PosPrintEngine.probePrintersStatusAsync(receiptIp, receiptPort, labelIp, labelPort,
+            new PosPrintEngine.StatusCallback() {
+                @Override public void onStatus(boolean receiptOnline, boolean labelOnline) {
+                    tvPrinterStatusBadge.setText(
+                        (receiptOnline ? "🟢收據" : "🔴收據") + " " + (labelOnline ? "🟢貼紙" : "🔴貼紙"));
+                    tvPrinterStatusBadge.setBackground(roundBg(
+                        (receiptOnline && labelOnline) ? Color.parseColor("#064E3B") : Color.parseColor("#450A0A"),
+                        (receiptOnline && labelOnline) ? Color.parseColor("#10B981") : Color.parseColor("#EF4444"),
+                        1, 6));
+                }
+            });
+    }
+
+    private void requireManagerPinIfSet(String actionTitle, final Runnable onAuthorized) {
+        if (managerPin == null || managerPin.trim().isEmpty()) {
+            onAuthorized.run();
+            return;
+        }
+        final EditText et = new EditText(this);
+        et.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+        et.setHint("請輸入 4 位數店長 PIN 碼");
+        new AlertDialog.Builder(this)
+            .setTitle("🔐 店長權限驗證：" + actionTitle)
+            .setView(et)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("確認", new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int w) {
+                    if (managerPin.equals(et.getText().toString().trim())) {
+                        onAuthorized.run();
+                    } else {
+                        Toast.makeText(MainActivity.this, "❌ PIN 碼錯誤！", Toast.LENGTH_SHORT).show();
+                    }
+                }
+            })
+            .show();
+    }
+
+    private void showSetManagerPinDialog() {
+        final EditText et = new EditText(this);
+        et.setInputType(InputType.TYPE_CLASS_NUMBER);
+        et.setHint("輸入 4 位數 PIN 碼 (留空則關閉鎖定)");
+        et.setText(managerPin);
+        new AlertDialog.Builder(this)
+            .setTitle("🔐 設定店長權限 PIN 碼（保護退單/關帳/設定）")
+            .setView(et)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("儲存", new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int w) {
+                    managerPin = et.getText().toString().trim();
+                    dbHelper.setSetting("manager_pin", managerPin);
+                    rebuildSettingsTab();
+                    Toast.makeText(MainActivity.this,
+                        managerPin.isEmpty() ? "🔓 已關閉店長 PIN 碼鎖定" : "🔐 已啟用店長 PIN 碼保護！",
+                        Toast.LENGTH_SHORT).show();
+                }
+            })
+            .show();
+    }
+
+    private void showPrinterDiscoveryDialog() {
+        Toast.makeText(this, "🔍 正在掃描店內區網 Port 9100 印表機，約需 3~5 秒...", Toast.LENGTH_SHORT).show();
+        PosPrintEngine.discoverPrintersAsync(new PosPrintEngine.DiscoveryCallback() {
+            @Override public void onResult(String subnetInfo, final List<PosPrintEngine.DiscoveredPrinter> printers) {
+                if (printers.isEmpty()) {
+                    new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("🔍 區網掃描完成 (" + subnetInfo + ")")
+                        .setMessage("未偵測到開啟 Port 9100 的網路印表機。\n請確認：\n1. 平板與印表機連在同一個店內 Wi-Fi 路由器\n2. 印表機電源與網路線已插妥")
+                        .setNeutralButton("重試掃描", new DialogInterface.OnClickListener() {
+                            @Override public void onClick(DialogInterface d, int w) { showPrinterDiscoveryDialog(); }
+                        })
+                        .setPositiveButton("關閉", null)
+                        .show();
+                    return;
+                }
+                String[] labels = new String[printers.size()];
+                for (int i = 0; i < printers.size(); i++) {
+                    PosPrintEngine.DiscoveredPrinter dpItem = printers.get(i);
+                    labels[i] = dpItem.ip + "  —  " + dpItem.hint;
+                }
+                new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("🖨️ 找到 " + printers.size() + " 台印表機 (" + subnetInfo + ")，點擊套用：")
+                    .setItems(labels, new DialogInterface.OnClickListener() {
+                        @Override public void onClick(DialogInterface d, final int which) {
+                            final PosPrintEngine.DiscoveredPrinter chosen = printers.get(which);
+                            new AlertDialog.Builder(MainActivity.this)
+                                .setTitle("套用 IP：" + chosen.ip)
+                                .setMessage("請問要將此 IP 設為哪一台印表機？")
+                                .setPositiveButton("🧾 設為 HPRT 收據機", new DialogInterface.OnClickListener() {
+                                    @Override public void onClick(DialogInterface d2, int w2) {
+                                        receiptIp = chosen.ip;
+                                        dbHelper.setSetting("receipt_ip", receiptIp);
+                                        refreshPrinterStatusBadge();
+                                        rebuildSettingsTab();
+                                        Toast.makeText(MainActivity.this, "✅ 已更新收據機 IP 為 " + receiptIp, Toast.LENGTH_SHORT).show();
+                                    }
+                                })
+                                .setNeutralButton("🏷️ 設為 GoDEX 貼紙機", new DialogInterface.OnClickListener() {
+                                    @Override public void onClick(DialogInterface d2, int w2) {
+                                        labelIp = chosen.ip;
+                                        dbHelper.setSetting("label_ip", labelIp);
+                                        refreshPrinterStatusBadge();
+                                        rebuildSettingsTab();
+                                        Toast.makeText(MainActivity.this, "✅ 已更新貼紙機 IP 為 " + labelIp, Toast.LENGTH_SHORT).show();
+                                    }
+                                })
+                                .setNegativeButton("取消", null)
+                                .show();
+                        }
+                    })
+                    .setNegativeButton("關閉", null)
+                    .show();
+            }
+        });
+    }
+
+    private void triggerCloudFullBackup() {
+        org.json.JSONObject snap = dbHelper.exportFullSnapshotJson(menuItems, closingHistory);
+        Toast.makeText(this, "⏳ 正在備份完整系統與營業資料至店家 Google 雲端硬碟...", Toast.LENGTH_SHORT).show();
+        CloudSyncManager.backupFullSnapshotAsync(googleSheetUrl, snap, new CloudSyncManager.SyncCallback() {
+            @Override public void onResult(boolean ok, String msg) {
+                new AlertDialog.Builder(MainActivity.this)
+                    .setTitle(ok ? "✅ 雲端硬碟備份成功" : "❌ 雲端硬碟備份失敗")
+                    .setMessage(msg)
+                    .setPositiveButton("確定", null)
+                    .show();
+            }
+        });
+    }
+
+    private void triggerCloudRestore() {
+        new AlertDialog.Builder(this)
+            .setTitle("♻️ 確認從店家 Google 雲端硬碟一鍵回復？")
+            .setMessage("此操作將從雲端【伊凡的花園_POS營業備份】資料夾讀取最新備份檔，並覆寫本機的：\n• 菜單品項與價格\n• 視覺化桌位排列\n• 雙印表機 IP 與版面微調參數\n• 歷史日結關帳紀錄\n\n確定要立即還原嗎？")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("立即一鍵還原", new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int w) {
+                    Toast.makeText(MainActivity.this, "⏳ 正在從 Google 雲端硬碟讀取最新備份...", Toast.LENGTH_SHORT).show();
+                    CloudSyncManager.restoreLatestSnapshotAsync(googleSheetUrl, new CloudSyncManager.SnapshotCallback() {
+                        @Override public void onResult(boolean ok, String msg, org.json.JSONObject snapshot) {
+                            if (!ok || snapshot == null) {
+                                new AlertDialog.Builder(MainActivity.this)
+                                    .setTitle("⚠️ 無法回復")
+                                    .setMessage(msg)
+                                    .setPositiveButton("好", null)
+                                    .show();
+                                return;
+                            }
+                            try {
+                                String summary = dbHelper.restoreFromSnapshotJson(snapshot);
+                                loadDatabaseState();
+                                refreshAllPosViews();
+                                refreshPrinterStatusBadge();
+                                rebuildSettingsTab();
+                                new AlertDialog.Builder(MainActivity.this)
+                                    .setTitle("✅ 系統一鍵回復完成！")
+                                    .setMessage("已成功從雲端還原：\n" + summary)
+                                    .setPositiveButton("太棒了", null)
+                                    .show();
+                            } catch (Exception e) {
+                                Toast.makeText(MainActivity.this, "還原寫入錯誤：" + e.getMessage(), Toast.LENGTH_LONG).show();
+                            }
+                        }
+                    });
+                }
+            })
+            .show();
+    }
+
+    private void showOtaUpdateDialog() {
+        final int curCode = getAppVersionCode();
+        Toast.makeText(this, "🔄 正在連線系統雲端檢查最新版本...", Toast.LENGTH_SHORT).show();
+        CloudSyncManager.checkOtaUpdateAsync(otaManifestUrl, curCode, new CloudSyncManager.OtaCallback() {
+            @Override public void onResult(boolean ok, String msg, final CloudSyncManager.OtaInfo info) {
+                if (!ok || info == null) {
+                    new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("⚠️ 無法檢查更新")
+                        .setMessage(msg)
+                        .setPositiveButton("確定", null)
+                        .show();
+                    return;
+                }
+                AlertDialog.Builder b = new AlertDialog.Builder(MainActivity.this)
+                    .setTitle(info.hasUpdate
+                        ? "🚀 發現新版本 v" + info.versionName + " (Build " + info.versionCode + ")"
+                        : "✅ 目前已是最新版本 (v" + getAppVersionName() + ")")
+                    .setMessage("雲端最新版本：v" + info.versionName + " (Build " + info.versionCode + ")\n"
+                        + "本機目前版本：v" + getAppVersionName() + " (Build " + curCode + ")\n\n"
+                        + "📋 更新內容：\n" + (info.releaseNotes.isEmpty() ? "(無)" : info.releaseNotes));
+                if (info.hasUpdate) {
+                    b.setPositiveButton("⬇️ 立即下載並更新", new DialogInterface.OnClickListener() {
+                        @Override public void onClick(DialogInterface d, int w) {
+                            startOtaDownloadAndInstall(info.apkUrl, "pos_update_v" + info.versionCode + ".apk");
+                        }
+                    });
+                }
+                if (info.rollbackUrl != null && !info.rollbackUrl.isEmpty()) {
+                    b.setNeutralButton("⏪ 退回上一穩定版", new DialogInterface.OnClickListener() {
+                        @Override public void onClick(DialogInterface d, int w) {
+                            startOtaDownloadAndInstall(info.rollbackUrl, "pos_rollback.apk");
+                        }
+                    });
+                }
+                b.setNegativeButton("關閉", null).show();
+            }
+        });
+    }
+
+    private void startOtaDownloadAndInstall(String apkUrl, String fileName) {
+        final java.io.File destFile = new java.io.File(PosFileProvider.getOtaDir(this), fileName);
+        Toast.makeText(this, "⬇️ 正在下載系統更新檔，請稍候...", Toast.LENGTH_SHORT).show();
+        CloudSyncManager.downloadApkAsync(apkUrl, destFile, new CloudSyncManager.DownloadCallback() {
+            @Override public void onProgress(int percent) {
+                if (percent == 50) {
+                    Toast.makeText(MainActivity.this, "⬇️ 下載進度 50%...", Toast.LENGTH_SHORT).show();
+                }
+            }
+            @Override public void onComplete(boolean success, String message, java.io.File apkFile) {
+                Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
+                if (success && apkFile != null && apkFile.exists()) {
+                    try {
+                        android.net.Uri apkUri = PosFileProvider.getApkUri(MainActivity.this, apkFile.getName());
+                        android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
+                        intent.setDataAndType(apkUri, "application/vnd.android.package-archive");
+                        intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(intent);
+                    } catch (Exception e) {
+                        new AlertDialog.Builder(MainActivity.this)
+                            .setTitle("⚠️ 請允許安裝未知應用程式")
+                            .setMessage("請至平板「設定 ➔ 應用程式 ➔ 伊凡的花園 POS ➔ 安裝未知應用程式」開啟允許後，再點一次更新。\n錯誤：" + e.getMessage())
+                            .setPositiveButton("確定", null)
+                            .show();
+                    }
+                }
+            }
+        });
+    }
+
+    private void showTechLogsDialog() {
+        ScrollView sv = new ScrollView(this);
+        TextView tv = new TextView(this);
+        tv.setText(PosPrintEngine.getTechLogsText());
+        tv.setTextColor(Color.WHITE);
+        tv.setTextSize(12);
+        tv.setTypeface(Typeface.MONOSPACE);
+        tv.setPadding(dp(14), dp(10), dp(14), dp(10));
+        tv.setBackgroundColor(Color.parseColor("#0F172A"));
+        sv.addView(tv);
+        new AlertDialog.Builder(this)
+            .setTitle("🩺 系統連線與印表機技術日誌 (最近 50 筆)")
+            .setView(sv)
             .setPositiveButton("關閉", null)
             .show();
     }

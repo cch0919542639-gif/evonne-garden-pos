@@ -33,6 +33,41 @@ public class PosPrintEngine {
         void onComplete(boolean allSuccess, String message);
     }
 
+    public interface StatusCallback {
+        void onStatus(boolean receiptOnline, boolean labelOnline);
+    }
+
+    public static class DiscoveredPrinter {
+        public String ip;
+        public String hint;
+        public boolean isGoDex;
+        public DiscoveredPrinter(String ip, String hint, boolean isGoDex) {
+            this.ip = ip;
+            this.hint = hint;
+            this.isGoDex = isGoDex;
+        }
+    }
+
+    public interface DiscoveryCallback {
+        void onResult(String subnetInfo, List<DiscoveredPrinter> printers);
+    }
+
+    private static final List<String> TECH_LOGS = new ArrayList<>();
+
+    public static synchronized void addTechLog(String msg) {
+        String ts = new java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.TAIWAN)
+            .format(new java.util.Date());
+        TECH_LOGS.add(0, "[" + ts + "] " + msg);
+        while (TECH_LOGS.size() > 50) TECH_LOGS.remove(TECH_LOGS.size() - 1);
+    }
+
+    public static synchronized String getTechLogsText() {
+        if (TECH_LOGS.isEmpty()) return "(目前尚無異常或連線日誌)";
+        StringBuilder sb = new StringBuilder();
+        for (String line : TECH_LOGS) sb.append(line).append("\n");
+        return sb.toString();
+    }
+
     // ==================== 可動態調整之出單機與貼紙機版面參數 ====================
     // 出單機字體縮放百分比：100(標準), 125(適中), 145(加大-預設), 165(特大), 185(超大), 210(巨字)
     public static volatile int receiptFontScalePercent = 145;
@@ -73,6 +108,7 @@ public class PosPrintEngine {
                         logs.add("🧾 出單機(" + receiptIp + ")：列印成功");
                     } catch (Exception e) {
                         ok = false;
+                        addTechLog("出單機連線失敗(" + receiptIp + ":" + receiptPort + "): " + e.getMessage());
                         logs.add("⚠️ 出單機(" + receiptIp + ")未連線：" + e.getMessage());
                     }
                 }
@@ -625,5 +661,130 @@ public class PosPrintEngine {
             sb.append(list.get(i));
         }
         return sb.toString();
+    }
+
+    // ==================== 區網印表機狀態偵測 & 自動搜尋 IP (Port 9100) ====================
+    public static void probePrintersStatusAsync(final String receiptIp, final int receiptPort,
+                                                final String labelIp, final int labelPort,
+                                                final StatusCallback cb) {
+        EXECUTOR.execute(new Runnable() {
+            @Override public void run() {
+                final boolean rOk = isPortOpen(receiptIp, receiptPort, 750);
+                final boolean lOk = isPortOpen(labelIp, labelPort, 750);
+                MAIN_HANDLER.post(new Runnable() {
+                    @Override public void run() {
+                        if (cb != null) cb.onStatus(rOk, lOk);
+                    }
+                });
+            }
+        });
+    }
+
+    private static boolean isPortOpen(String ip, int port, int timeoutMs) {
+        if (ip == null || ip.trim().isEmpty()) return false;
+        Socket s = null;
+        try {
+            s = new Socket();
+            s.connect(new InetSocketAddress(ip.trim(), port), timeoutMs);
+            return true;
+        } catch (Exception e) {
+            return false;
+        } finally {
+            if (s != null) try { s.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    public static void discoverPrintersAsync(final DiscoveryCallback cb) {
+        EXECUTOR.execute(new Runnable() {
+            @Override public void run() {
+                final List<String> prefixes = getLocalIpv4Prefixes();
+                final List<DiscoveredPrinter> found = java.util.Collections.synchronizedList(new ArrayList<DiscoveredPrinter>());
+                if (prefixes.isEmpty()) {
+                    addTechLog("區網搜尋失敗：未偵測到區域網路 IPv4 介面");
+                    MAIN_HANDLER.post(new Runnable() {
+                        @Override public void run() {
+                            if (cb != null) cb.onResult("未連上區網 Wi-Fi", found);
+                        }
+                    });
+                    return;
+                }
+                final String targetPrefix = prefixes.get(0);
+                ExecutorService pool = Executors.newFixedThreadPool(32);
+                final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(254);
+                for (int i = 1; i <= 254; i++) {
+                    final String candidateIp = targetPrefix + i;
+                    pool.execute(new Runnable() {
+                        @Override public void run() {
+                            try {
+                                if (isPortOpen(candidateIp, 9100, 350)) {
+                                    DiscoveredPrinter dp = probePrinterIdentity(candidateIp);
+                                    found.add(dp);
+                                }
+                            } finally {
+                                latch.countDown();
+                            }
+                        }
+                    });
+                }
+                try { latch.await(8, java.util.concurrent.TimeUnit.SECONDS); } catch (Exception ignored) {}
+                pool.shutdownNow();
+                addTechLog("區網掃描(" + targetPrefix + "0/24) 完成，找到 " + found.size() + " 台 Port 9100 設備");
+                MAIN_HANDLER.post(new Runnable() {
+                    @Override public void run() {
+                        if (cb != null) cb.onResult(targetPrefix + "0/24", new ArrayList<>(found));
+                    }
+                });
+            }
+        });
+    }
+
+    private static DiscoveredPrinter probePrinterIdentity(String ip) {
+        Socket s = null;
+        try {
+            s = new Socket();
+            s.connect(new InetSocketAddress(ip, 9100), 600);
+            s.setSoTimeout(450);
+            OutputStream os = s.getOutputStream();
+            os.write("~V\r\n".getBytes(StandardCharsets.US_ASCII));
+            os.flush();
+            byte[] buf = new byte[128];
+            int n = s.getInputStream().read(buf);
+            if (n > 0) {
+                String resp = new String(buf, 0, n, StandardCharsets.US_ASCII).replaceAll("[\\r\\n]+", " ").trim();
+                if (resp.toUpperCase(java.util.Locale.US).contains("GODEX")
+                    || resp.toUpperCase(java.util.Locale.US).contains("DT2")) {
+                    return new DiscoveredPrinter(ip, "GoDEX 貼紙機 (" + resp + ")", true);
+                }
+                return new DiscoveredPrinter(ip, "Port 9100 印表機 (" + resp + ")", false);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (s != null) try { s.close(); } catch (Exception ignored) {}
+        }
+        return new DiscoveredPrinter(ip, "ESC/POS 收據出單機 (Port 9100)", false);
+    }
+
+    private static List<String> getLocalIpv4Prefixes() {
+        List<String> list = new ArrayList<>();
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> en = java.net.NetworkInterface.getNetworkInterfaces();
+            while (en != null && en.hasMoreElements()) {
+                java.net.NetworkInterface ni = en.nextElement();
+                if (!ni.isUp() || ni.isLoopback()) continue;
+                java.util.Enumeration<java.net.InetAddress> addrs = ni.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    java.net.InetAddress addr = addrs.nextElement();
+                    if (addr instanceof java.net.Inet4Address && addr.isSiteLocalAddress()) {
+                        String host = addr.getHostAddress();
+                        int lastDot = host != null ? host.lastIndexOf('.') : -1;
+                        if (lastDot > 0) {
+                            String prefix = host.substring(0, lastDot + 1);
+                            if (!list.contains(prefix)) list.add(prefix);
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return list;
     }
 }

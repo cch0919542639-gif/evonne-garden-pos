@@ -554,4 +554,174 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
         }
         return clean;
     }
+
+    // ==================== 完整系統快照備份 & 雲端一鍵回復 & 斷網補傳佇列 ====================
+    public JSONObject exportFullSnapshotJson(List<MainActivity.MenuItem> menu,
+                                             List<MainActivity.ClosingRecord> closings) {
+        JSONObject root = new JSONObject();
+        try {
+            root.put("backupVersion", 1);
+            root.put("storeName", "伊凡的花園 Evonne's Garden");
+            root.put("exportedAt", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.TAIWAN).format(new Date()));
+
+            JSONObject settingsObj = new JSONObject();
+            SQLiteDatabase db = getReadableDatabase();
+            Cursor c = null;
+            try {
+                c = db.rawQuery("SELECT setting_key, setting_value FROM app_settings", null);
+                while (c.moveToNext()) {
+                    String k = c.getString(0);
+                    if (!"pending_sync_queue".equals(k)) {
+                        settingsObj.put(k, c.getString(1));
+                    }
+                }
+            } finally {
+                if (c != null) c.close();
+            }
+            root.put("settings", settingsObj);
+
+            JSONArray menuArr = new JSONArray();
+            if (menu != null) {
+                for (MainActivity.MenuItem m : menu) {
+                    JSONObject o = new JSONObject();
+                    o.put("id", m.id);
+                    o.put("cat", m.cat);
+                    o.put("name", m.name);
+                    o.put("sub", m.sub);
+                    o.put("price", m.price);
+                    o.put("isDrink", m.isDrink);
+                    o.put("hasFreeTea", m.hasFreeTea);
+                    o.put("fixedSweet", m.fixedSweet);
+                    o.put("coldOnly", m.coldOnly);
+                    o.put("isThickMilk", m.isThickMilk);
+                    JSONArray ch = new JSONArray();
+                    if (m.choices != null) for (String s : m.choices) ch.put(s);
+                    o.put("choices", ch);
+                    menuArr.put(o);
+                }
+            }
+            root.put("menu", menuArr);
+
+            JSONArray closeArr = new JSONArray();
+            if (closings != null) {
+                int limit = Math.min(closings.size(), 365);
+                for (int i = 0; i < limit; i++) {
+                    MainActivity.ClosingRecord cr = closings.get(i);
+                    JSONObject co = new JSONObject();
+                    co.put("time", cr.time);
+                    co.put("validCount", cr.validCount);
+                    co.put("voidCount", cr.voidCount);
+                    co.put("netSales", cr.netSales);
+                    co.put("cashSales", cr.cashSales);
+                    co.put("openingFloat", cr.openingFloat);
+                    co.put("byPayJson", cr.byPayJson != null ? cr.byPayJson : "{}");
+                    co.put("itemRankJson", cr.itemRankJson != null ? cr.itemRankJson : "{}");
+                    co.put("printedPaper", cr.printedPaper);
+                    co.put("cloudSynced", cr.cloudSynced);
+                    co.put("cloudStatus", cr.cloudStatus != null ? cr.cloudStatus : "");
+                    closeArr.put(co);
+                }
+            }
+            root.put("closings", closeArr);
+        } catch (Exception ignored) {}
+        return root;
+    }
+
+    public String restoreFromSnapshotJson(JSONObject snap) throws Exception {
+        if (snap == null) throw new IllegalArgumentException("雲端備份資料為空");
+        SQLiteDatabase db = getWritableDatabase();
+        int restoredSettings = 0, restoredMenu = 0, restoredClosings = 0;
+        db.beginTransaction();
+        try {
+            JSONObject settingsObj = snap.optJSONObject("settings");
+            if (settingsObj != null) {
+                java.util.Iterator<String> keys = settingsObj.keys();
+                while (keys.hasNext()) {
+                    String k = keys.next();
+                    String val = settingsObj.optString(k, "");
+                    if ("google_sheet_url".equals(k) && val.isEmpty()) continue;
+                    ContentValues cv = new ContentValues();
+                    cv.put("setting_key", k);
+                    cv.put("setting_value", val);
+                    db.insertWithOnConflict("app_settings", null, cv, SQLiteDatabase.CONFLICT_REPLACE);
+                    restoredSettings++;
+                }
+            }
+
+            JSONArray menuArr = snap.optJSONArray("menu");
+            if (menuArr != null && menuArr.length() > 0) {
+                db.delete("menu_items", null, null);
+                for (int i = 0; i < menuArr.length(); i++) {
+                    JSONObject o = menuArr.getJSONObject(i);
+                    JSONArray ch = o.optJSONArray("choices");
+                    String[] choices = new String[ch != null ? ch.length() : 0];
+                    if (ch != null) for (int k = 0; k < ch.length(); k++) choices[k] = ch.optString(k, "");
+                    MainActivity.MenuItem m = new MainActivity.MenuItem(
+                        o.optInt("id", i + 1),
+                        o.optString("cat", "其他"),
+                        o.optString("name", "未命名"),
+                        o.optString("sub", ""),
+                        Math.max(0, o.optInt("price", 0)),
+                        o.optBoolean("isDrink", false),
+                        o.optBoolean("hasFreeTea", false),
+                        o.optBoolean("fixedSweet", false),
+                        o.optBoolean("coldOnly", false),
+                        o.optBoolean("isThickMilk", false),
+                        choices
+                    );
+                    upsertMenuItemInternal(db, m);
+                    restoredMenu++;
+                }
+            }
+
+            JSONArray closeArr = snap.optJSONArray("closings");
+            if (closeArr != null && closeArr.length() > 0) {
+                db.delete("daily_closings", null, null);
+                for (int i = closeArr.length() - 1; i >= 0; i--) {
+                    JSONObject co = closeArr.getJSONObject(i);
+                    ContentValues cv = new ContentValues();
+                    cv.put("close_time", co.optString("time", ""));
+                    cv.put("valid_count", co.optInt("validCount", 0));
+                    cv.put("void_count", co.optInt("voidCount", 0));
+                    cv.put("net_sales", co.optInt("netSales", 0));
+                    cv.put("cash_sales", co.optInt("cashSales", 0));
+                    cv.put("opening_float", co.optInt("openingFloat", 2000));
+                    cv.put("by_pay_json", co.optString("byPayJson", "{}"));
+                    cv.put("item_rank_json", co.optString("itemRankJson", "{}"));
+                    cv.put("printed_paper", co.optBoolean("printedPaper", false) ? 1 : 0);
+                    cv.put("csv_path", "");
+                    cv.put("cloud_synced", co.optBoolean("cloudSynced", true) ? 1 : 0);
+                    cv.put("cloud_status", co.optString("cloudStatus", "✅ 已由雲端備份還原"));
+                    db.insert("daily_closings", null, cv);
+                    restoredClosings++;
+                }
+            }
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
+        return "設定 " + restoredSettings + " 項｜菜單 " + restoredMenu + " 道｜關帳歷史 " + restoredClosings + " 筆";
+    }
+
+    public synchronized void enqueuePendingSync(String jsonPayload) {
+        if (jsonPayload == null || jsonPayload.isEmpty()) return;
+        try {
+            JSONArray arr = getPendingSyncArray();
+            arr.put(jsonPayload);
+            setSetting("pending_sync_queue", arr.toString());
+        } catch (Exception ignored) {}
+    }
+
+    public synchronized JSONArray getPendingSyncArray() {
+        String raw = getSetting("pending_sync_queue", "[]");
+        try {
+            return new JSONArray(raw);
+        } catch (Exception e) {
+            return new JSONArray();
+        }
+    }
+
+    public synchronized void savePendingSyncArray(JSONArray arr) {
+        setSetting("pending_sync_queue", arr != null ? arr.toString() : "[]");
+    }
 }

@@ -62,6 +62,28 @@ public class CloudSyncManager {
         void onResult(boolean success, String message, List<PendingQrOrder> pendingOrders);
     }
 
+    public interface SnapshotCallback {
+        void onResult(boolean success, String message, JSONObject snapshot);
+    }
+
+    public static class OtaInfo {
+        public int versionCode;
+        public String versionName;
+        public String apkUrl;
+        public String rollbackUrl;
+        public String releaseNotes;
+        public boolean hasUpdate;
+    }
+
+    public interface OtaCallback {
+        void onResult(boolean success, String message, OtaInfo info);
+    }
+
+    public interface DownloadCallback {
+        void onProgress(int percent);
+        void onComplete(boolean success, String message, java.io.File apkFile);
+    }
+
     private static final ExecutorService EXECUTOR = Executors.newSingleThreadExecutor();
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
     private static final int CONNECT_TIMEOUT_MS = 10000;
@@ -80,6 +102,16 @@ public class CloudSyncManager {
                                                    final Map<String, Integer> byPay,
                                                    final Map<String, Integer> itemRank,
                                                    final SyncCallback callback) {
+        uploadClosingAndOrdersAsync(webAppUrl, cr, orders, byPay, itemRank, null, callback);
+    }
+
+    public static void uploadClosingAndOrdersAsync(final String webAppUrl,
+                                                   final MainActivity.ClosingRecord cr,
+                                                   final List<MainActivity.OrderRecord> orders,
+                                                   final Map<String, Integer> byPay,
+                                                   final Map<String, Integer> itemRank,
+                                                   final PosDatabaseHelper offlineQueueDb,
+                                                   final SyncCallback callback) {
         if (!isValidWebAppUrl(webAppUrl)) {
             postResult(callback, false, "尚未設定有效的 Google 試算表網址 (已先完成本地 SQLite 與 CSV 備份)");
             return;
@@ -87,6 +119,7 @@ public class CloudSyncManager {
         EXECUTOR.execute(new Runnable() {
             @Override
             public void run() {
+                String payloadStr = "";
                 try {
                     JSONObject root = new JSONObject();
                     root.put("action", "upload_closing");
@@ -123,11 +156,16 @@ public class CloudSyncManager {
                         }
                     }
                     root.put("orders", ordArr);
+                    payloadStr = root.toString();
 
-                    String resp = postJsonFollowRedirects(webAppUrl.trim(), root.toString());
+                    String resp = postJsonFollowRedirects(webAppUrl.trim(), payloadStr);
                     postResult(callback, true, "✅ 已成功上傳至 Google 試算表！(" + resp + ")");
                 } catch (Exception e) {
-                    postResult(callback, false, "⚠️ 雲端暫時無法連線 (已存入待補傳佇列)：" + e.getMessage());
+                    PosPrintEngine.addTechLog("關帳上傳失敗(已入佇列): " + e.getMessage());
+                    if (offlineQueueDb != null && !payloadStr.isEmpty()) {
+                        offlineQueueDb.enqueuePendingSync(payloadStr);
+                    }
+                    postResult(callback, false, "⚠️ 雲端暫時無法連線 (已存入待補傳佇列，恢復網路將自動補傳)：" + e.getMessage());
                 }
             }
         });
@@ -345,7 +383,7 @@ public class CloudSyncManager {
     }
 
     // ==================== HTTP POST + Google Apps Script 302 轉址處理 ====================
-    private static String postJsonFollowRedirects(String urlStr, String jsonBody) throws Exception {
+    public static String postJsonFollowRedirects(String urlStr, String jsonBody) throws Exception {
         HttpURLConnection conn = null;
         try {
             URL url = new URL(urlStr);
@@ -411,5 +449,245 @@ public class CloudSyncManager {
                 if (cb != null) cb.onResult(ok, msg);
             }
         });
+    }
+
+    // ==================== 6. 店家 Google Drive 私人資料夾完整備份 & 一鍵回復 ====================
+    public static void backupFullSnapshotAsync(final String webAppUrl,
+                                               final JSONObject snapshotJson,
+                                               final SyncCallback callback) {
+        if (!isValidWebAppUrl(webAppUrl)) {
+            postResult(callback, false, "請先設定有效的 Google 試算表網址");
+            return;
+        }
+        EXECUTOR.execute(new Runnable() {
+            @Override public void run() {
+                try {
+                    JSONObject req = new JSONObject();
+                    req.put("action", "backup_full_snapshot");
+                    req.put("snapshot", snapshotJson);
+                    String resp = postJsonFollowRedirects(webAppUrl.trim(), req.toString());
+                    JSONObject jo = new JSONObject(resp);
+                    if ("ok".equals(jo.optString("status"))) {
+                        postResult(callback, true, "✅ 已完整備份至店家 Google 雲端硬碟【"
+                            + jo.optString("folderName", "伊凡的花園_POS營業備份") + "】！\n檔案："
+                            + jo.optString("fileName", "POS_完整備份.json"));
+                    } else {
+                        postResult(callback, false, "⚠️ 雲端備份回應異常：" + resp);
+                    }
+                } catch (Exception e) {
+                    PosPrintEngine.addTechLog("雲端完整備份失敗: " + e.getMessage());
+                    postResult(callback, false, "❌ 備份至 Google 雲端硬碟失敗：" + e.getMessage());
+                }
+            }
+        });
+    }
+
+    public static void restoreLatestSnapshotAsync(final String webAppUrl,
+                                                  final SnapshotCallback callback) {
+        if (!isValidWebAppUrl(webAppUrl)) {
+            MAIN_HANDLER.post(new Runnable() {
+                @Override public void run() {
+                    if (callback != null) callback.onResult(false, "請先貼上有效的 Google 試算表網址", null);
+                }
+            });
+            return;
+        }
+        EXECUTOR.execute(new Runnable() {
+            @Override public void run() {
+                try {
+                    JSONObject req = new JSONObject();
+                    req.put("action", "restore_latest_snapshot");
+                    String resp = postJsonFollowRedirects(webAppUrl.trim(), req.toString());
+                    final JSONObject jo = new JSONObject(resp);
+                    if (!"ok".equals(jo.optString("status")) || jo.optJSONObject("snapshot") == null) {
+                        throw new IllegalStateException(jo.optString("message", "Google 雲端硬碟尚無完整備份檔"));
+                    }
+                    final JSONObject snap = jo.getJSONObject("snapshot");
+                    MAIN_HANDLER.post(new Runnable() {
+                        @Override public void run() {
+                            if (callback != null) {
+                                callback.onResult(true, "✅ 已成功讀取雲端最新備份 ("
+                                    + snap.optString("exportedAt", "") + ")", snap);
+                            }
+                        }
+                    });
+                } catch (final Exception e) {
+                    PosPrintEngine.addTechLog("雲端回復讀取失敗: " + e.getMessage());
+                    MAIN_HANDLER.post(new Runnable() {
+                        @Override public void run() {
+                            if (callback != null) callback.onResult(false, "❌ 雲端回復失敗：" + e.getMessage(), null);
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    // ==================== 7. 斷網自動補傳佇列 ====================
+    public static void flushPendingSyncQueueAsync(final String webAppUrl,
+                                                  final PosDatabaseHelper dbHelper,
+                                                  final SyncCallback callback) {
+        if (!isValidWebAppUrl(webAppUrl) || dbHelper == null) return;
+        EXECUTOR.execute(new Runnable() {
+            @Override public void run() {
+                JSONArray queue = dbHelper.getPendingSyncArray();
+                if (queue.length() == 0) return;
+                JSONArray remaining = new JSONArray();
+                int flushed = 0;
+                for (int i = 0; i < queue.length(); i++) {
+                    String payload = queue.optString(i, "");
+                    if (payload.isEmpty()) continue;
+                    try {
+                        postJsonFollowRedirects(webAppUrl.trim(), payload);
+                        flushed++;
+                    } catch (Exception e) {
+                        remaining.put(payload);
+                    }
+                }
+                dbHelper.savePendingSyncArray(remaining);
+                if (flushed > 0) {
+                    PosPrintEngine.addTechLog("斷網補傳完成：已補傳 " + flushed + " 筆關帳資料");
+                    postResult(callback, true, "☁️ 網路已恢復，已自動補傳 " + flushed + " 筆離線關帳資料至試算表！");
+                }
+            }
+        });
+    }
+
+    // ==================== 8. 系統雲端 OTA 遠端檢查更新與 APK 下載 ====================
+    public static void checkOtaUpdateAsync(final String manifestUrl,
+                                           final int currentVersionCode,
+                                           final OtaCallback callback) {
+        if (manifestUrl == null || !manifestUrl.trim().startsWith("https://")) {
+            MAIN_HANDLER.post(new Runnable() {
+                @Override public void run() {
+                    if (callback != null) callback.onResult(false, "請設定有效的 https:// 更新清單網址 (version.json)", null);
+                }
+            });
+            return;
+        }
+        EXECUTOR.execute(new Runnable() {
+            @Override public void run() {
+                try {
+                    String body = getUrlFollowRedirects(manifestUrl.trim());
+                    JSONObject jo = new JSONObject(body);
+                    final OtaInfo info = new OtaInfo();
+                    info.versionCode = jo.optInt("versionCode", currentVersionCode);
+                    info.versionName = jo.optString("versionName", "1.0");
+                    info.apkUrl = jo.optString("apkUrl", "");
+                    info.rollbackUrl = jo.optString("rollbackUrl", "");
+                    info.releaseNotes = jo.optString("releaseNotes", "");
+                    info.hasUpdate = info.versionCode > currentVersionCode && !info.apkUrl.isEmpty();
+                    MAIN_HANDLER.post(new Runnable() {
+                        @Override public void run() {
+                            if (callback != null) callback.onResult(true, "檢查完成", info);
+                        }
+                    });
+                } catch (final Exception e) {
+                    PosPrintEngine.addTechLog("OTA 檢查更新失敗: " + e.getMessage());
+                    MAIN_HANDLER.post(new Runnable() {
+                        @Override public void run() {
+                            if (callback != null) callback.onResult(false, "❌ 檢查更新失敗：" + e.getMessage(), null);
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    public static void downloadApkAsync(final String apkUrl,
+                                        final java.io.File destFile,
+                                        final DownloadCallback callback) {
+        EXECUTOR.execute(new Runnable() {
+            @Override public void run() {
+                HttpURLConnection conn = null;
+                InputStream is = null;
+                java.io.FileOutputStream fos = null;
+                try {
+                    String curUrl = apkUrl.trim();
+                    for (int hop = 0; hop < 6; hop++) {
+                        URL url = new URL(curUrl);
+                        conn = (HttpURLConnection) url.openConnection();
+                        conn.setInstanceFollowRedirects(false);
+                        conn.setConnectTimeout(15000);
+                        conn.setReadTimeout(30000);
+                        conn.setRequestMethod("GET");
+                        int code = conn.getResponseCode();
+                        if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+                            String loc = conn.getHeaderField("Location");
+                            conn.disconnect();
+                            if (loc == null || loc.isEmpty()) throw new RuntimeException("下載轉址失敗");
+                            curUrl = loc;
+                            continue;
+                        }
+                        break;
+                    }
+                    if (conn == null || conn.getResponseCode() >= 400) {
+                        throw new RuntimeException("HTTP " + (conn != null ? conn.getResponseCode() : -1));
+                    }
+                    int totalLen = conn.getContentLength();
+                    is = conn.getInputStream();
+                    fos = new java.io.FileOutputStream(destFile);
+                    byte[] buf = new byte[8192];
+                    int read, downloaded = 0, lastPct = -1;
+                    while ((read = is.read(buf)) != -1) {
+                        fos.write(buf, 0, read);
+                        downloaded += read;
+                        if (totalLen > 0) {
+                            final int pct = (int) ((downloaded * 100L) / totalLen);
+                            if (pct != lastPct && (pct % 10 == 0 || pct == 100)) {
+                                lastPct = pct;
+                                MAIN_HANDLER.post(new Runnable() {
+                                    @Override public void run() {
+                                        if (callback != null) callback.onProgress(pct);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    fos.flush();
+                    MAIN_HANDLER.post(new Runnable() {
+                        @Override public void run() {
+                            if (callback != null) callback.onComplete(true, "✅ 下載完成，準備啟動安裝程式！", destFile);
+                        }
+                    });
+                } catch (final Exception e) {
+                    PosPrintEngine.addTechLog("OTA APK 下載失敗: " + e.getMessage());
+                    MAIN_HANDLER.post(new Runnable() {
+                        @Override public void run() {
+                            if (callback != null) callback.onComplete(false, "❌ 下載 APK 失敗：" + e.getMessage(), null);
+                        }
+                    });
+                } finally {
+                    try { if (fos != null) fos.close(); } catch (Exception ignored) {}
+                    try { if (is != null) is.close(); } catch (Exception ignored) {}
+                    if (conn != null) conn.disconnect();
+                }
+            }
+        });
+    }
+
+    private static String getUrlFollowRedirects(String urlStr) throws Exception {
+        String curUrl = urlStr;
+        for (int hop = 0; hop < 6; hop++) {
+            HttpURLConnection conn = null;
+            try {
+                conn = (HttpURLConnection) new URL(curUrl).openConnection();
+                conn.setInstanceFollowRedirects(false);
+                conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
+                conn.setReadTimeout(READ_TIMEOUT_MS);
+                conn.setRequestMethod("GET");
+                int code = conn.getResponseCode();
+                if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+                    String loc = conn.getHeaderField("Location");
+                    if (loc == null || loc.isEmpty()) throw new RuntimeException("空白轉址");
+                    curUrl = loc;
+                    continue;
+                }
+                return readStream(conn.getInputStream());
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+        }
+        throw new RuntimeException("轉址次數過多");
     }
 }

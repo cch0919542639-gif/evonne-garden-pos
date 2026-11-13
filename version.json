@@ -1,0 +1,7 @@
+{
+  "versionCode": 3,
+  "versionName": "1.2",
+  "apkUrl": "https://github.com/cch0919542639-gif/evonne-garden-pos/releases/latest/download/pos_tablet_app.apk",
+  "rollbackUrl": "",
+  "releaseNotes": "v1.2 (Build 3) 重大更新：\n1. 新增區網印表機 IP 自動搜尋與頂部即時連線燈號\n2. 新增店家 Google 雲端硬碟完整系統快照備份 & 換機一鍵回復\n3. 新增斷網離線補傳佇列（恢復網路自動補傳關帳）\n4. 新增系統 OTA 遠端線上檢查更新與店長 4 位數 PIN 碼權限鎖"
+}

@@ -204,6 +204,41 @@ function doPost(e) {
       return jsonResponse({ status: "ok", menu: outMenu });
     }
 
+    // ==================== 7. 店家私人 Google 雲端硬碟完整系統快照備份 (DriveApp) ====================
+    if (action === "backup_full_snapshot") {
+      var snap = payload.snapshot || {};
+      var folderName = "伊凡的花園_POS營業備份";
+      var folder = getOrCreateDriveFolder(folderName);
+      var stamp = Utilities.formatDate(new Date(), "GMT+8", "yyyy-MM-dd_HHmm");
+      var fileName = "POS_完整備份_" + stamp + ".json";
+      var jsonStr = JSON.stringify(snap, null, 2);
+
+      // 1. 留存歷史時間戳備份檔
+      folder.createFile(fileName, jsonStr, MimeType.PLAIN_TEXT);
+
+      // 2. 更新最新備份檔 POS_最新備份_LATEST.json 供換新平板一鍵回復
+      var latestName = "POS_最新備份_LATEST.json";
+      var existing = folder.getFilesByName(latestName);
+      if (existing.hasNext()) {
+        existing.next().setContent(jsonStr);
+      } else {
+        folder.createFile(latestName, jsonStr, MimeType.PLAIN_TEXT);
+      }
+      return jsonResponse({ status: "ok", folderName: folderName, fileName: fileName });
+    }
+
+    // ==================== 8. 從店家私人 Google 雲端硬碟一鍵讀取最新完整備份 ====================
+    if (action === "restore_latest_snapshot") {
+      var rFolder = getOrCreateDriveFolder("伊凡的花園_POS營業備份");
+      var files = rFolder.getFilesByName("POS_最新備份_LATEST.json");
+      if (!files.hasNext()) {
+        return jsonResponse({ status: "empty", message: "雲端資料夾「伊凡的花園_POS營業備份」尚無備份檔，請先於原平板點「☁️ 完整備份至店家 Google 雲端硬碟」。" });
+      }
+      var content = files.next().getBlob().getDataAsString("UTF-8");
+      var parsedSnap = JSON.parse(content);
+      return jsonResponse({ status: "ok", snapshot: parsedSnap });
+    }
+
     return jsonResponse({ status: "error", message: "Unknown action" });
   } catch (err) {
     return jsonResponse({ status: "error", message: String(err) });
@@ -610,6 +645,12 @@ function renderMobileOrderWebApp(ss, defaultTable) {
     .setTitle("伊凡的花園 - 線上掃碼點餐 (" + safeTable + ")")
     .addMetaTag("viewport", "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no")
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function getOrCreateDriveFolder(folderName) {
+  var folders = DriveApp.getFoldersByName(folderName);
+  if (folders.hasNext()) return folders.next();
+  return DriveApp.createFolder(folderName);
 }
 
 function getOrCreateSheet(ss, name, headers) {
