@@ -1,7 +1,7 @@
 {
-  "versionCode": 4,
-  "versionName": "1.3",
+  "versionCode": 5,
+  "versionName": "1.4",
   "apkUrl": "https://github.com/cch0919542639-gif/evonne-garden-pos/releases/latest/download/pos_tablet_app.apk",
   "rollbackUrl": "",
-  "releaseNotes": "v1.3 (Build 4) 商業化白牌與彈性人員交班版：\n1. 去單店寫死 ➔ 支援任意門市白牌設定檔（店名/代碼/地址電話/收據頁尾）與新店開通精靈\n2. 新增標準化快照 Schema v2 與本機 JSON 匯出/匯入（未來可無痛轉移至 SaaS 平台）\n3. 新增彈性員工分權、班別交班現金盤點與退單/折扣操作稽核日誌（小店可一鍵保持極簡免切換模式）"
+  "releaseNotes": "v1.4 (Build 5) 商業授權與錢櫃整合版：\n1. 新增 RSA-2048 離線商業授權驗證模組（支援買斷 / 年費 / 月租 + 14 天試用 + 功能分級解鎖，創始門市自動豁免）\n2. 新增出單機 RJ-11 錢櫃連動彈開指令 (ESC p)，支援現金結帳自動開錢箱與手動測試開錢箱"
 }

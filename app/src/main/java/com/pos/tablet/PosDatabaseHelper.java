@@ -801,7 +801,10 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
                 c = db.rawQuery("SELECT setting_key, setting_value FROM app_settings", null);
                 while (c.moveToNext()) {
                     String k = c.getString(0);
-                    if (!"pending_sync_queue".equals(k)) {
+                    if (!"pending_sync_queue".equals(k)
+                        && !"license_token".equals(k)
+                        && !"license_last_seen_date".equals(k)
+                        && !"trial_start_date".equals(k)) {
                         settingsObj.put(k, c.getString(1));
                     }
                 }

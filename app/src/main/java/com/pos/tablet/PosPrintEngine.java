@@ -102,6 +102,10 @@ public class PosPrintEngine {
     // 貼紙機左右安全內縮點數
     public static volatile int labelMarginDots = 12;
 
+    // 錢櫃 RJ-11 自動彈開控制 (透過出單機 ESC/POS ESC p 脈衝)
+    public static volatile boolean autoOpenCashDrawerOnCash = false;
+    private static final byte[] ESC_POS_KICK_DRAWER = new byte[]{0x1B, 0x70, 0x00, 0x19, (byte) 0xFA};
+
     private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(2);
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
     private static final int CONNECT_TIMEOUT_MS = 3000;
@@ -118,17 +122,32 @@ public class PosPrintEngine {
                 final List<String> logs = new ArrayList<>();
                 boolean ok = true;
 
-                // A. 列印 HPRT TP805L 收據/廚房總單
+                // A. 列印 HPRT TP805L 收據/廚房總單 (含選擇性錢櫃彈開脈衝)
                 if (order.printReceipt) {
                     try {
                         Bitmap recBmp = renderReceiptBitmap(order, receiptWidthMm);
                         byte[] escPosBytes = encodeEscPosRasterReceipt(recBmp, true);
+                        if (order.triggerCashDrawer) {
+                            ByteArrayOutputStream combined = new ByteArrayOutputStream(escPosBytes.length + ESC_POS_KICK_DRAWER.length);
+                            combined.write(escPosBytes);
+                            combined.write(ESC_POS_KICK_DRAWER);
+                            escPosBytes = combined.toByteArray();
+                        }
                         sendTcpWithRetry(receiptIp, receiptPort, escPosBytes);
-                        logs.add("🧾 出單機(" + receiptIp + ")：列印成功");
+                        logs.add("🧾 出單機(" + receiptIp + ")：列印成功" + (order.triggerCashDrawer ? " (已開錢箱)" : ""));
                     } catch (Exception e) {
                         ok = false;
                         addTechLog("出單機連線失敗(" + receiptIp + ":" + receiptPort + "): " + e.getMessage());
                         logs.add("⚠️ 出單機(" + receiptIp + ")未連線：" + e.getMessage());
+                    }
+                } else if (order.triggerCashDrawer) {
+                    try {
+                        sendTcpWithRetry(receiptIp, receiptPort, ESC_POS_KICK_DRAWER);
+                        logs.add("💰 已透過出單機彈開錢櫃");
+                    } catch (Exception e) {
+                        ok = false;
+                        addTechLog("錢櫃開啟失敗(" + receiptIp + ":" + receiptPort + "): " + e.getMessage());
+                        logs.add("⚠️ 錢櫃開啟失敗：" + e.getMessage());
                     }
                 }
 
@@ -226,6 +245,22 @@ public class PosPrintEngine {
                     postResult(callback, true, "🤝 HPRT TP805L 交班對帳單列印成功！");
                 } catch (Exception e) {
                     postResult(callback, false, "⚠️ 交班單列印失敗 (" + receiptIp + ")：" + e.getMessage());
+                }
+            }
+        });
+    }
+
+    public static void openCashDrawerAsync(final String receiptIp, final int receiptPort,
+                                           final PrintCallback callback) {
+        EXECUTOR.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    sendTcpWithRetry(receiptIp, receiptPort, ESC_POS_KICK_DRAWER);
+                    postResult(callback, true, "💰 錢櫃已彈開！(" + receiptIp + ")");
+                } catch (Exception e) {
+                    addTechLog("手動開錢箱失敗(" + receiptIp + ":" + receiptPort + "): " + e.getMessage());
+                    postResult(callback, false, "❌ 開錢箱失敗：" + e.getMessage());
                 }
             }
         });

@@ -217,6 +217,7 @@ public class MainActivity extends Activity {
         public int stickerCount;
         public boolean voided = false;
         public String staffName = "";
+        public transient boolean triggerCashDrawer = false;
     }
 
     public static class StaffMember {
@@ -300,6 +301,7 @@ public class MainActivity extends Activity {
     private String shiftStartTime = "";
     private long lastHandoverOrderDbId = 0L;
     private final List<StaffMember> staffMembers = new ArrayList<>();
+    private LicenseManager.LicenseState licenseState = null;
 
     private final List<MenuItem> menuItems = new ArrayList<>();
     private final List<DrinkUpgradeOption> mealDrinkPool = new ArrayList<>();
@@ -582,6 +584,7 @@ public class MainActivity extends Activity {
         labelProtocol = dbHelper.getSetting("label_protocol", "EZPL");
         PosPrintEngine.labelFontScalePercent = dbHelper.getIntSetting("label_font_scale", 115);
         PosPrintEngine.labelMarginDots = dbHelper.getIntSetting("label_margin_dots", 12);
+        PosPrintEngine.autoOpenCashDrawerOnCash = "1".equals(dbHelper.getSetting("auto_open_cash_drawer", "0"));
         googleSheetUrl = dbHelper.getSetting("google_sheet_url", "");
         otaManifestUrl = dbHelper.getSetting("ota_manifest_url", DEFAULT_OTA_MANIFEST_URL);
         managerPin = dbHelper.getSetting("manager_pin", "");
@@ -614,7 +617,27 @@ public class MainActivity extends Activity {
 
         closingHistory.clear();
         closingHistory.addAll(dbHelper.loadClosingHistory());
+        refreshLicenseState();
         return isFirstFreshInstall;
+    }
+
+    private void refreshLicenseState() {
+        licenseState = LicenseManager.evaluate(this, dbHelper, PosPrintEngine.storeCode);
+        dbHelper.setSetting("plan_type", licenseState.planCode);
+        dbHelper.setSetting("enabled_features", licenseState.enabledFeatures);
+    }
+
+    private boolean ensureFeatureAllowed(String featureKey, String featureLabel) {
+        if (licenseState == null) refreshLicenseState();
+        if (!licenseState.canCheckout) {
+            showLicenseActivationDialog("⚠️ " + featureLabel + " 需要有效授權（目前狀態：" + licenseState.statusSummary + "）");
+            return false;
+        }
+        if (featureKey != null && !licenseState.hasFeature(featureKey)) {
+            showLicenseActivationDialog("🔒 「" + featureLabel + "」尚未包含在目前方案 (" + licenseState.planLabel + ") 中。\n可聯繫供應商升級解鎖此模組，或繼續正常營業核心結帳功能。");
+            return false;
+        }
+        return true;
     }
 
     private int dp(int v) {
@@ -2563,6 +2586,7 @@ public class MainActivity extends Activity {
 
     // ==================== 📱 掃碼線上點餐待接單中心 & 各桌 QR Code 立牌列印系統 ====================
     private void showQrOrdersAndStandeeDialog() {
+        if (!ensureFeatureAllowed(LicenseManager.FEATURE_QR, "手機掃碼點餐 & 桌牌中心")) return;
         int screenW = getResources().getDisplayMetrics().widthPixels;
         int screenH = getResources().getDisplayMetrics().heightPixels;
         final int dialogW = (int) (screenW * 0.94f);
@@ -2943,6 +2967,7 @@ public class MainActivity extends Activity {
         switchMainTab(0);
 
         if (autoCheckoutAndPrint) {
+            if (!ensureFeatureAllowed(LicenseManager.FEATURE_CORE, "點餐結帳")) return;
             int due = getCartGrandTotal();
             OrderRecord rec = new OrderRecord();
             rec.callNum = formatCallNum(callSequence);
@@ -2957,6 +2982,9 @@ public class MainActivity extends Activity {
             rec.printReceipt = globalPrintReceipt;
             rec.stickerCount = getTotalStickersCount();
             rec.staffName = staffModeEnabled ? currentStaffName : "";
+            rec.triggerCashDrawer = PosPrintEngine.autoOpenCashDrawerOnCash
+                && "現金".equals(rec.paymentMethod)
+                && (licenseState == null || licenseState.hasFeature(LicenseManager.FEATURE_CASH_DRAWER));
 
             dbHelper.insertOrder(rec);
             ordersHistory.add(0, rec);
@@ -2975,6 +3003,7 @@ public class MainActivity extends Activity {
 
     // ==================== CHECKOUT & PRINT PREVIEW DIALOG ====================
     private void showCheckoutDialog() {
+        if (!ensureFeatureAllowed(LicenseManager.FEATURE_CORE, "點餐結帳")) return;
         if (cart.isEmpty()) {
             Toast.makeText(this, "購物車是空的，請先點選餐點！", Toast.LENGTH_SHORT).show();
             return;
@@ -3090,6 +3119,9 @@ public class MainActivity extends Activity {
                 rec.printReceipt = globalPrintReceipt;
                 rec.stickerCount = getTotalStickersCount();
                 rec.staffName = staffModeEnabled ? currentStaffName : "";
+                rec.triggerCashDrawer = PosPrintEngine.autoOpenCashDrawerOnCash
+                    && "現金".equals(rec.paymentMethod)
+                    && (licenseState == null || licenseState.hasFeature(LicenseManager.FEATURE_CASH_DRAWER));
 
                 // 寫入本地 SQLite 資料庫並持久化下一單取餐號
                 dbHelper.insertOrder(rec);
@@ -3546,6 +3578,35 @@ public class MainActivity extends Activity {
             ViewGroup.LayoutParams.WRAP_CONTENT, dp(40));
         lpCloseBtn.leftMargin = dp(8);
         headerRow.addView(btnCloseDay, lpCloseBtn);
+
+        Button btnOpenDrawer = new Button(this);
+        btnOpenDrawer.setText("💰 開錢箱");
+        btnOpenDrawer.setAllCaps(false);
+        btnOpenDrawer.setTextSize(12);
+        btnOpenDrawer.setTextColor(Color.WHITE);
+        btnOpenDrawer.setBackground(roundBg(Color.parseColor("#B45309"), 0, 0, 8));
+        btnOpenDrawer.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (!ensureFeatureAllowed(LicenseManager.FEATURE_CASH_DRAWER, "錢櫃 RJ-11 控制")) return;
+                authorizeAction("手動開啟錢櫃", false, new Runnable() {
+                    @Override public void run() {
+                        if (auditLogEnabled || staffModeEnabled) {
+                            dbHelper.insertAuditLog(
+                                staffModeEnabled ? currentStaffName : "店長",
+                                "OPEN_DRAWER", receiptIp, "手動開啟錢櫃");
+                        }
+                        PosPrintEngine.openCashDrawerAsync(receiptIp, receiptPort, new PosPrintEngine.PrintCallback() {
+                            @Override public void onComplete(boolean ok, String msg) {
+                                Toast.makeText(MainActivity.this, msg, Toast.LENGTH_SHORT).show();
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        LinearLayout.LayoutParams lpDrw = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40));
+        lpDrw.leftMargin = dp(6);
+        headerRow.addView(btnOpenDrawer, lpDrw);
         viewClosing.addView(headerRow);
 
         TextView tvSummary = new TextView(this);
@@ -3865,8 +3926,10 @@ public class MainActivity extends Activity {
                 dbHelper.setSetting("store_subtitle", sub);
                 dbHelper.setSetting("store_receipt_footer", ft);
                 dbHelper.setSetting("store_initialized", "1");
+                refreshLicenseState();
                 updateBrandAndStaffHeader();
                 refreshCartUI();
+                rebuildSettingsTab();
                 Toast.makeText(MainActivity.this, "✅ 已儲存門市品牌：【" + ss + "】", Toast.LENGTH_SHORT).show();
             }
         });
@@ -3907,6 +3970,32 @@ public class MainActivity extends Activity {
         });
         brandBtnRow.addView(btnImportLocalSnap, new LinearLayout.LayoutParams(0, dp(36), 1f));
         brandPanel.addView(brandBtnRow);
+
+        // 商業授權狀態與設備指紋列
+        if (licenseState == null) refreshLicenseState();
+        LinearLayout licRow = new LinearLayout(this);
+        licRow.setOrientation(LinearLayout.HORIZONTAL);
+        licRow.setGravity(Gravity.CENTER_VERTICAL);
+        licRow.setPadding(0, dp(6), 0, 0);
+
+        TextView tvLicStatus = new TextView(this);
+        tvLicStatus.setText("🔑 設備碼：" + licenseState.deviceCode + " ｜ " + licenseState.statusSummary);
+        tvLicStatus.setTextColor(licenseState.canCheckout ? Color.parseColor("#A7F3D0") : Color.parseColor("#FCA5A5"));
+        tvLicStatus.setTextSize(12);
+        licRow.addView(tvLicStatus, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        Button btnManageLic = new Button(this);
+        btnManageLic.setText("🔑 輸入授權碼 / 方案明細");
+        btnManageLic.setAllCaps(false);
+        btnManageLic.setTextSize(11);
+        btnManageLic.setTextColor(Color.parseColor("#052E16"));
+        btnManageLic.setTypeface(null, Typeface.BOLD);
+        btnManageLic.setBackground(roundBg(Color.parseColor("#F59E0B"), 0, 0, 6));
+        btnManageLic.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { showLicenseActivationDialog(null); }
+        });
+        licRow.addView(btnManageLic, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)));
+        brandPanel.addView(licRow);
         box.addView(brandPanel);
 
         // 1. 出單機 HPRT TP805L 設定、字體大小調整與防邊緣裁切設定
@@ -4102,6 +4191,46 @@ public class MainActivity extends Activity {
         marginRow.addView(btnRightPlus, new LinearLayout.LayoutParams(0, dp(32), 0.65f));
 
         recTunePanel.addView(marginRow);
+
+        // (D) 錢櫃 RJ-11 連動彈開設定 (透過出單機 ESC/POS ESC p 脈衝)
+        LinearLayout drawerRow = new LinearLayout(this);
+        drawerRow.setOrientation(LinearLayout.HORIZONTAL);
+        drawerRow.setGravity(Gravity.CENTER_VERTICAL);
+        drawerRow.setPadding(0, dp(6), 0, 0);
+
+        Button btnToggleAutoDrawer = makeMiniTuneBtn(
+            PosPrintEngine.autoOpenCashDrawerOnCash
+                ? "💰 現金結帳自動彈開錢櫃：✅ 已開啟"
+                : "💰 現金結帳自動彈開錢櫃：⚪ 已關閉",
+            new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    if (!ensureFeatureAllowed(LicenseManager.FEATURE_CASH_DRAWER, "錢櫃 RJ-11 控制")) return;
+                    PosPrintEngine.autoOpenCashDrawerOnCash = !PosPrintEngine.autoOpenCashDrawerOnCash;
+                    dbHelper.setSetting("auto_open_cash_drawer", PosPrintEngine.autoOpenCashDrawerOnCash ? "1" : "0");
+                    rebuildSettingsTab();
+                }
+            });
+        if (PosPrintEngine.autoOpenCashDrawerOnCash) {
+            btnToggleAutoDrawer.setTextColor(Color.parseColor("#052E16"));
+            btnToggleAutoDrawer.setBackground(roundBg(Color.parseColor("#10B981"), 0, 0, 6));
+        }
+        LinearLayout.LayoutParams lpAd = new LinearLayout.LayoutParams(0, dp(34), 1.4f);
+        lpAd.rightMargin = dp(6);
+        drawerRow.addView(btnToggleAutoDrawer, lpAd);
+
+        Button btnTestDrawer = makeMiniTuneBtn("🔓 測試彈開錢箱 (RJ-11)", new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (!ensureFeatureAllowed(LicenseManager.FEATURE_CASH_DRAWER, "錢櫃 RJ-11 控制")) return;
+                PosPrintEngine.openCashDrawerAsync(receiptIp, receiptPort, new PosPrintEngine.PrintCallback() {
+                    @Override public void onComplete(boolean ok, String msg) {
+                        Toast.makeText(MainActivity.this, msg, Toast.LENGTH_SHORT).show();
+                    }
+                });
+            }
+        });
+        drawerRow.addView(btnTestDrawer, new LinearLayout.LayoutParams(0, dp(34), 1f));
+        recTunePanel.addView(drawerRow);
+
         box.addView(recTunePanel);
 
         // 2. 貼紙機 GoDEX DT2x 設定與連線測試
@@ -4441,6 +4570,7 @@ public class MainActivity extends Activity {
             staffModeEnabled ? Color.parseColor("#38BDF8") : Color.parseColor("#334155"), 0, 0, 6));
         btnToggleStaffMode.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
+                if (!staffModeEnabled && !ensureFeatureAllowed(LicenseManager.FEATURE_STAFF, "多員工權限與交班管理")) return;
                 staffModeEnabled = !staffModeEnabled;
                 dbHelper.setSetting("staff_mode_enabled", staffModeEnabled ? "1" : "0");
                 if (staffModeEnabled) {
@@ -4465,6 +4595,7 @@ public class MainActivity extends Activity {
             shiftHandoverEnabled ? Color.parseColor("#F59E0B") : Color.parseColor("#334155"), 0, 0, 6));
         btnToggleHandover.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
+                if (!shiftHandoverEnabled && !ensureFeatureAllowed(LicenseManager.FEATURE_STAFF, "多員工權限與交班管理")) return;
                 shiftHandoverEnabled = !shiftHandoverEnabled;
                 dbHelper.setSetting("shift_handover_enabled", shiftHandoverEnabled ? "1" : "0");
                 rebuildClosingTab();
@@ -5487,6 +5618,7 @@ public class MainActivity extends Activity {
     }
 
     private void triggerCloudFullBackup() {
+        if (!ensureFeatureAllowed(LicenseManager.FEATURE_CLOUD_BACKUP, "Google 雲端硬碟備份與同步")) return;
         org.json.JSONObject snap = dbHelper.exportFullSnapshotJson(menuItems, closingHistory);
         Toast.makeText(this, "⏳ 正在備份完整系統與營業資料至店家 Google 雲端硬碟...", Toast.LENGTH_SHORT).show();
         CloudSyncManager.backupFullSnapshotAsync(googleSheetUrl, snap, new CloudSyncManager.SyncCallback() {
@@ -5623,6 +5755,79 @@ public class MainActivity extends Activity {
             .setTitle("🩺 系統連線與印表機技術日誌 (最近 50 筆)")
             .setView(sv)
             .setPositiveButton("關閉", null)
+            .show();
+    }
+
+    private void showLicenseActivationDialog(String reasonBanner) {
+        if (licenseState == null) refreshLicenseState();
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(12), dp(16), dp(12));
+
+        if (reasonBanner != null && !reasonBanner.isEmpty()) {
+            TextView tvWarn = new TextView(this);
+            tvWarn.setText(reasonBanner);
+            tvWarn.setTextColor(Color.parseColor("#B91C1C"));
+            tvWarn.setTextSize(13);
+            tvWarn.setTypeface(null, Typeface.BOLD);
+            tvWarn.setPadding(0, 0, 0, dp(8));
+            box.addView(tvWarn);
+        }
+
+        TextView tvInfo = new TextView(this);
+        tvInfo.setText("• 本機設備識別碼：" + licenseState.deviceCode + "（請傳給供應商以簽發授權碼）\n"
+            + "• 門市代碼：" + PosPrintEngine.storeCode + "\n"
+            + "• 目前方案：" + licenseState.planLabel + "\n"
+            + "• 目前狀態：" + licenseState.statusSummary + "\n"
+            + "• 已解鎖功能模組：" + licenseState.enabledFeatures
+            + "\n\n【模組代碼說明】core=基礎收銀出單｜qr=手機掃碼點餐｜cloud_backup=雲端硬碟備份｜staff=員工交班稽核｜cash_drawer=錢櫃彈開");
+        tvInfo.setTextSize(13);
+        tvInfo.setPadding(0, 0, 0, dp(10));
+        box.addView(tvInfo);
+
+        final EditText etToken = new EditText(this);
+        etToken.setHint("請貼上 POS1.xxxxx.yyyyy 商業授權碼");
+        etToken.setText(dbHelper.getSetting("license_token", ""));
+        etToken.setTextSize(12);
+        etToken.setMinLines(2);
+        box.addView(etToken);
+
+        new AlertDialog.Builder(this)
+            .setTitle("🔑 商業授權管理與功能分級開通")
+            .setView(box)
+            .setNegativeButton("關閉", null)
+            .setNeutralButton("📤 匯出本機資料快照", new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int w) {
+                    org.json.JSONObject snap = dbHelper.exportFullSnapshotJson(menuItems, closingHistory);
+                    String path = dbHelper.exportSnapshotToLocalFile(snap);
+                    Toast.makeText(MainActivity.this, "✅ 已匯出：" + path, Toast.LENGTH_LONG).show();
+                }
+            })
+            .setPositiveButton("✅ 驗證並啟用授權碼", new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int w) {
+                    try {
+                        LicenseManager.LicenseState updated = LicenseManager.verifyAndSaveToken(
+                            MainActivity.this, dbHelper, etToken.getText().toString().trim(), PosPrintEngine.storeCode);
+                        licenseState = updated;
+                        refreshLicenseState();
+                        rebuildSettingsTab();
+                        new AlertDialog.Builder(MainActivity.this)
+                            .setTitle("✅ 授權驗證成功！")
+                            .setMessage("目前方案：" + updated.planLabel
+                                + "\n狀態：" + updated.statusSummary
+                                + "\n已解鎖模組：" + updated.enabledFeatures)
+                            .setPositiveButton("太棒了", null)
+                            .show();
+                    } catch (Exception e) {
+                        new AlertDialog.Builder(MainActivity.this)
+                            .setTitle("❌ 授權碼無效")
+                            .setMessage(e.getMessage())
+                            .setPositiveButton("確定", null)
+                            .show();
+                    }
+                }
+            })
             .show();
     }
 }
