@@ -19,7 +19,7 @@ import java.util.Locale;
 /**
  * 商業化離線授權與功能分級控管模組 (RSA-2048 公開金鑰驗章，免額外授權伺服器即可驗證)
  * 支援商業模式：
- * 1. 創始/內部門市自動豁免 (EVONNE-001)
+ * 1. 創始/內部門市自動豁免 (以 SHA-256 雜湊比對，不於原始碼留存明文代碼)
  * 2. 新店 14 天全功能免費試用
  * 3. 一次性買斷 (LIFETIME) / 年費 (ANNUAL) / 月租 (MONTHLY) + 7 天到期寬限期
  * 4. 功能模組分級解鎖 (core, qr, cloud_backup, staff, cash_drawer)
@@ -85,12 +85,28 @@ public class LicenseManager {
         }
     }
 
+    private static final String FOUNDER_CODE_SHA256 =
+        "841a21aa2f4f1d482271db1599ec45d4cfa8c2cd3be0f92779cd023bc7171641";
+
+    private static boolean isFounderStoreCode(String storeCode) {
+        if (storeCode == null || storeCode.trim().isEmpty()) return false;
+        try {
+            byte[] dig = MessageDigest.getInstance("SHA-256")
+                .digest(storeCode.trim().toUpperCase(Locale.US).getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder();
+            for (byte b : dig) hex.append(String.format(Locale.US, "%02x", b & 0xFF));
+            return FOUNDER_CODE_SHA256.equals(hex.toString());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     public static LicenseState evaluate(Context ctx, PosDatabaseHelper db, String storeCode) {
         LicenseState st = new LicenseState();
         st.deviceCode = getDeviceCode(ctx);
 
-        // 1. 創始/內部直營門市保留完全豁免權
-        if ("EVONNE-001".equalsIgnoreCase(storeCode != null ? storeCode.trim() : "")) {
+        // 1. 創始/內部門市保留豁免權 (SHA-256 雜湊比對)
+        if (isFounderStoreCode(storeCode)) {
             st.planCode = "FOUNDER";
             st.planLabel = "創始門市永久授權";
             st.expiryDate = "2099-12-31";

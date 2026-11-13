@@ -562,11 +562,11 @@ public class MainActivity extends Activity {
                 || !dbHelper.getSetting("google_sheet_url", "").isEmpty()
                 || !dbHelper.getSetting("receipt_ip", "").isEmpty();
             if (hasLegacy) {
-                // 舊版門市平板無痛升級：自動保留原門市品牌資料
-                dbHelper.setSetting("store_code", "EVONNE-001");
-                dbHelper.setSetting("store_name", "伊凡的花園 Evonne's Garden");
-                dbHelper.setSetting("store_short_name", "伊凡的花園");
-                dbHelper.setSetting("store_subtitle", "高雄市三民區龍江街120號｜0982-708-572");
+                // 舊版升級相容：使用中性預設門市檔（實機既有設定可透過資料庫或設定頁維護）
+                dbHelper.setSetting("store_code", "LEGACY-001");
+                dbHelper.setSetting("store_name", "我的餐飲門市");
+                dbHelper.setSetting("store_short_name", "我的門市");
+                dbHelper.setSetting("store_subtitle", "");
                 dbHelper.setSetting("store_initialized", "1");
             } else {
                 isFirstFreshInstall = true;
