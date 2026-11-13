@@ -42,6 +42,8 @@ public class LicenseManager {
     public static final String FEATURE_CLOUD_BACKUP = "cloud_backup";
     public static final String FEATURE_STAFF = "staff";
     public static final String FEATURE_CASH_DRAWER = "cash_drawer";
+    public static final String FEATURE_EINVOICE = "einvoice";
+    public static final String FEATURE_MULTI_PAY = "multi_pay";
 
     public static class LicenseState {
         public String deviceCode = "DEV-UNKNOWN";
@@ -52,7 +54,7 @@ public class LicenseManager {
         public boolean isTrial = true;
         public boolean inGrace = false;
         public boolean canCheckout = true;
-        public String enabledFeatures = "core,qr,cloud_backup,staff,cash_drawer";
+        public String enabledFeatures = "core,qr,cloud_backup,staff,cash_drawer,einvoice,multi_pay";
         public String statusSummary = "";
 
         public boolean hasFeature(String featureKey) {
@@ -96,7 +98,7 @@ public class LicenseManager {
             st.isTrial = false;
             st.inGrace = false;
             st.canCheckout = true;
-            st.enabledFeatures = "core,qr,cloud_backup,staff,cash_drawer";
+            st.enabledFeatures = "core,qr,cloud_backup,staff,cash_drawer,einvoice,multi_pay";
             st.statusSummary = "👑 " + st.planLabel + " (全功能永久開通)";
             return st;
         }
@@ -168,7 +170,7 @@ public class LicenseManager {
         st.expiryDate = addDays(trialStart, TRIAL_DAYS);
         st.daysRemaining = Math.max(0, leftDays);
         st.isTrial = true;
-        st.enabledFeatures = "core,qr,cloud_backup,staff,cash_drawer";
+        st.enabledFeatures = "core,qr,cloud_backup,staff,cash_drawer,einvoice,multi_pay";
 
         if (leftDays >= 0) {
             st.canCheckout = true;

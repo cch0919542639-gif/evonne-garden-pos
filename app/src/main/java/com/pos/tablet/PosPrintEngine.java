@@ -212,8 +212,18 @@ public class PosPrintEngine {
                             combined.write(ESC_POS_KICK_DRAWER);
                             escPosBytes = combined.toByteArray();
                         }
+                        if (shouldPrintEinvoiceProof(order)) {
+                            Bitmap proofBmp = renderEinvoiceProofBitmap(order, receiptWidthMm);
+                            byte[] proofBytes = encodeEscPosRasterReceipt(proofBmp, true);
+                            ByteArrayOutputStream combined = new ByteArrayOutputStream(escPosBytes.length + proofBytes.length);
+                            combined.write(escPosBytes);
+                            combined.write(proofBytes);
+                            escPosBytes = combined.toByteArray();
+                        }
                         sendBytes(receiptConnMode, receiptIp, receiptPort, receiptBtMac, receiptUsbId, escPosBytes);
-                        logs.add("🧾 出單機(" + recTarget + ")：列印成功" + (order.triggerCashDrawer ? " (已開錢箱)" : ""));
+                        logs.add("🧾 出單機(" + recTarget + ")：列印成功"
+                            + (shouldPrintEinvoiceProof(order) ? " + 電子發票證明聯(" + order.invoiceNo + ")" : "")
+                            + (order.triggerCashDrawer ? " (已開錢箱)" : ""));
                     } catch (Exception e) {
                         ok = false;
                         addTechLog("出單機連線失敗(" + recTarget + "): " + e.getMessage());
@@ -790,9 +800,25 @@ public class PosPrintEngine {
         StaticLayout slTotal = buildLayout(footerSb.toString(), tpTotal, innerW, Layout.Alignment.ALIGN_NORMAL);
 
         StaticLayout slCash = null;
+        StringBuilder metaSb = new StringBuilder();
         if ("現金".equals(order.paymentMethod)) {
-            String cashLine = "實收：$" + order.cashReceived + "   找零：$" + order.cashChange;
-            slCash = buildLayout(cashLine, tpItem, innerW, Layout.Alignment.ALIGN_NORMAL);
+            metaSb.append("實收：$").append(order.cashReceived).append("   找零：$").append(order.cashChange);
+        }
+        if (order.paymentTxId != null && !order.paymentTxId.trim().isEmpty()) {
+            if (metaSb.length() > 0) metaSb.append("\n");
+            metaSb.append("交易序號：").append(order.paymentTxId.trim());
+        }
+        if (order.invoiceNo != null && !order.invoiceNo.trim().isEmpty() && !"VOIDED".equals(order.invoiceStatus)) {
+            if (metaSb.length() > 0) metaSb.append("\n");
+            metaSb.append("發票號碼：").append(order.invoiceNo.trim());
+            if (TaiwanCommerceGateway.CARRIER_MOBILE.equals(order.carrierType)) {
+                metaSb.append(" (手機條碼 ").append(order.carrierCode).append(")");
+            } else if (TaiwanCommerceGateway.CARRIER_DONATE.equals(order.carrierType)) {
+                metaSb.append(" (愛心碼 ").append(order.carrierCode).append(")");
+            }
+        }
+        if (metaSb.length() > 0) {
+            slCash = buildLayout(metaSb.toString(), tpItem, innerW, Layout.Alignment.ALIGN_NORMAL);
         }
         StaticLayout slCustomFooter = (storeReceiptFooter != null && !storeReceiptFooter.trim().isEmpty())
             ? buildLayout(storeReceiptFooter.trim(), tpSub, innerW, Layout.Alignment.ALIGN_CENTER)
@@ -855,6 +881,109 @@ public class PosPrintEngine {
             drawStaticLayout(canvas, slCustomFooter, leftPad, y + 4);
         }
 
+        return bmp;
+    }
+
+    public static boolean shouldPrintEinvoiceProof(MainActivity.OrderRecord order) {
+        if (order == null || order.voided || "VOIDED".equals(order.invoiceStatus)) return false;
+        if (order.invoiceNo == null || order.invoiceNo.trim().isEmpty()) return false;
+        boolean hasBuyer = order.buyerTaxId != null && !order.buyerTaxId.trim().isEmpty();
+        boolean isPaper = order.carrierType == null || order.carrierType.isEmpty()
+            || TaiwanCommerceGateway.CARRIER_PAPER.equals(order.carrierType);
+        return isPaper || hasBuyer || TaiwanCommerceGateway.invoiceCfg.printProofWithCarrier;
+    }
+
+    public static void printEinvoiceProofAsync(final MainActivity.OrderRecord order,
+                                               final String receiptIp, final int receiptPort,
+                                               final int widthMm, final PrintCallback callback) {
+        EXECUTOR.execute(new Runnable() {
+            @Override public void run() {
+                String target = formatTarget(receiptConnMode, receiptIp, receiptBtMac, receiptUsbId);
+                try {
+                    if (order == null || order.invoiceNo == null || order.invoiceNo.trim().isEmpty()) {
+                        throw new IllegalArgumentException("此訂單尚未開立電子發票");
+                    }
+                    Bitmap bmp = renderEinvoiceProofBitmap(order, widthMm);
+                    byte[] payload = encodeEscPosRasterReceipt(bmp, true);
+                    sendBytes(receiptConnMode, receiptIp, receiptPort, receiptBtMac, receiptUsbId, payload);
+                    postResult(callback, true, "🧾 已列印電子發票證明聯 (" + order.invoiceNo + ")");
+                } catch (Exception e) {
+                    postResult(callback, false, "⚠️ 證明聯列印失敗 (" + target + ")：" + e.getMessage());
+                }
+            }
+        });
+    }
+
+    /**
+     * 台灣財政部規範風格：電子發票證明聯點陣排版 (57/80mm 相容，含雙 QR Code)
+     */
+    public static Bitmap renderEinvoiceProofBitmap(MainActivity.OrderRecord order, int widthMm) {
+        int totalDots = Math.max(320, (receiptPrintableDots / 8) * 8);
+        int leftPad = Math.max(0, receiptLeftMarginDots);
+        int rightPad = Math.max(8, receiptRightMarginDots);
+        int innerW = Math.max(200, totalDots - leftPad - rightPad);
+
+        float wf = (totalDots <= 400) ? 0.80f : 1.0f;
+        TextPaint tpBrand = makeBoldPaint(28f * wf);
+        TextPaint tpTitle = makeBoldPaint(30f * wf);
+        TextPaint tpBigNo = makeBoldPaint(34f * wf);
+        TextPaint tpInfo = makeBoldPaint(20f * wf);
+
+        String brand = getEffectiveShortName();
+        if ("SANDBOX".equals(order.invoiceStatus)) {
+            brand += " [測試模擬]";
+        }
+        String period = (order.invoicePeriod != null && !order.invoicePeriod.isEmpty())
+            ? order.invoicePeriod : TaiwanCommerceGateway.formatRocPeriod(new java.util.Date());
+        String invNo = order.invoiceNo != null ? order.invoiceNo : "TW-00000000";
+        String rnd = (order.invoiceRandom != null && !order.invoiceRandom.isEmpty()) ? order.invoiceRandom : "0000";
+        String seller = TaiwanCommerceGateway.isValidTaiwanTaxId(TaiwanCommerceGateway.invoiceCfg.sellerTaxId)
+            ? TaiwanCommerceGateway.invoiceCfg.sellerTaxId : "00000000";
+        String dtStr = new java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.TAIWAN).format(new java.util.Date())
+            + " " + (order.time != null ? order.time : "");
+
+        StringBuilder meta = new StringBuilder();
+        meta.append(dtStr).append("\n");
+        meta.append("隨機碼：").append(rnd).append("   總計：").append(order.total).append("\n");
+        meta.append("賣方：").append(seller);
+        if (order.buyerTaxId != null && !order.buyerTaxId.trim().isEmpty()) {
+            meta.append("   買方：").append(order.buyerTaxId.trim());
+        }
+
+        StaticLayout slBrand = buildLayout(brand, tpBrand, innerW, Layout.Alignment.ALIGN_CENTER);
+        StaticLayout slTitle = buildLayout("電子發票證明聯", tpTitle, innerW, Layout.Alignment.ALIGN_CENTER);
+        StaticLayout slPeriod = buildLayout(period + "\n" + invNo, tpBigNo, innerW, Layout.Alignment.ALIGN_CENTER);
+        StaticLayout slMeta = buildLayout(meta.toString(), tpInfo, innerW, Layout.Alignment.ALIGN_NORMAL);
+
+        int qrSize = Math.min(180, Math.max(120, (innerW - 24) / 2));
+        String qlStr = (order.invoiceQrLeft != null && !order.invoiceQrLeft.isEmpty()) ? order.invoiceQrLeft : invNo;
+        String qrStr = (order.invoiceQrRight != null && !order.invoiceQrRight.isEmpty()) ? order.invoiceQrRight : "**";
+        Bitmap bmpQrL = QrCodeGenerator.generateQrBitmap(qlStr, qrSize);
+        Bitmap bmpQrR = QrCodeGenerator.generateQrBitmap(qrStr, qrSize);
+
+        int qrRealSize = Math.max(bmpQrL.getHeight(), bmpQrR.getHeight());
+        int totalH = 20 + slBrand.getHeight() + 6 + slTitle.getHeight() + 6
+            + slPeriod.getHeight() + 12 + slMeta.getHeight() + 14 + qrRealSize + 34;
+
+        Bitmap bmp = Bitmap.createBitmap(totalDots, totalH, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bmp);
+        canvas.drawColor(Color.WHITE);
+
+        int y = 14;
+        drawStaticLayout(canvas, slBrand, leftPad, y);
+        y += slBrand.getHeight() + 6;
+        drawStaticLayout(canvas, slTitle, leftPad, y);
+        y += slTitle.getHeight() + 6;
+        drawStaticLayout(canvas, slPeriod, leftPad, y);
+        y += slPeriod.getHeight() + 10;
+        drawStaticLayout(canvas, slMeta, leftPad, y);
+        y += slMeta.getHeight() + 12;
+
+        int gap = 16;
+        int pairW = bmpQrL.getWidth() + gap + bmpQrR.getWidth();
+        int startX = leftPad + Math.max(0, (innerW - pairW) / 2);
+        canvas.drawBitmap(bmpQrL, startX, y, null);
+        canvas.drawBitmap(bmpQrR, startX + bmpQrL.getWidth() + gap, y, null);
         return bmp;
     }
 

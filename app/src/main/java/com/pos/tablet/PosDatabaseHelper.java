@@ -28,7 +28,7 @@ import java.util.Map;
 public class PosDatabaseHelper extends SQLiteOpenHelper {
 
     private static final String DB_NAME = "evonne_garden_pos.db";
-    private static final int DB_VERSION = 2;
+    private static final int DB_VERSION = 3;
     private final Context appContext;
 
     public PosDatabaseHelper(Context context) {
@@ -74,7 +74,18 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
             + "voided INTEGER NOT NULL DEFAULT 0, "
             + "closed INTEGER NOT NULL DEFAULT 0, "
             + "synced INTEGER NOT NULL DEFAULT 0, "
-            + "staff_name TEXT NOT NULL DEFAULT '')");
+            + "staff_name TEXT NOT NULL DEFAULT '', "
+            + "invoice_no TEXT NOT NULL DEFAULT '', "
+            + "invoice_period TEXT NOT NULL DEFAULT '', "
+            + "invoice_random TEXT NOT NULL DEFAULT '', "
+            + "buyer_tax_id TEXT NOT NULL DEFAULT '', "
+            + "carrier_type TEXT NOT NULL DEFAULT 'PAPER', "
+            + "carrier_code TEXT NOT NULL DEFAULT '', "
+            + "invoice_status TEXT NOT NULL DEFAULT 'NONE', "
+            + "invoice_qr_left TEXT NOT NULL DEFAULT '', "
+            + "invoice_qr_right TEXT NOT NULL DEFAULT '', "
+            + "payment_tx_id TEXT NOT NULL DEFAULT '', "
+            + "payment_provider TEXT NOT NULL DEFAULT '')");
 
         db.execSQL("CREATE TABLE IF NOT EXISTS daily_closings ("
             + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -129,6 +140,26 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
             try {
                 db.execSQL("ALTER TABLE orders ADD COLUMN staff_name TEXT NOT NULL DEFAULT ''");
             } catch (Exception ignored) {}
+        }
+        if (oldVersion < 3) {
+            String[] v3Cols = {
+                "invoice_no TEXT NOT NULL DEFAULT ''",
+                "invoice_period TEXT NOT NULL DEFAULT ''",
+                "invoice_random TEXT NOT NULL DEFAULT ''",
+                "buyer_tax_id TEXT NOT NULL DEFAULT ''",
+                "carrier_type TEXT NOT NULL DEFAULT 'PAPER'",
+                "carrier_code TEXT NOT NULL DEFAULT ''",
+                "invoice_status TEXT NOT NULL DEFAULT 'NONE'",
+                "invoice_qr_left TEXT NOT NULL DEFAULT ''",
+                "invoice_qr_right TEXT NOT NULL DEFAULT ''",
+                "payment_tx_id TEXT NOT NULL DEFAULT ''",
+                "payment_provider TEXT NOT NULL DEFAULT ''"
+            };
+            for (String colDef : v3Cols) {
+                try {
+                    db.execSQL("ALTER TABLE orders ADD COLUMN " + colDef);
+                } catch (Exception ignored) {}
+            }
         }
     }
 
@@ -298,9 +329,33 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
         cv.put("closed", 0);
         cv.put("synced", 0);
         cv.put("staff_name", rec.staffName != null ? rec.staffName : "");
+        cv.put("invoice_no", rec.invoiceNo != null ? rec.invoiceNo : "");
+        cv.put("invoice_period", rec.invoicePeriod != null ? rec.invoicePeriod : "");
+        cv.put("invoice_random", rec.invoiceRandom != null ? rec.invoiceRandom : "");
+        cv.put("buyer_tax_id", rec.buyerTaxId != null ? rec.buyerTaxId : "");
+        cv.put("carrier_type", rec.carrierType != null ? rec.carrierType : "PAPER");
+        cv.put("carrier_code", rec.carrierCode != null ? rec.carrierCode : "");
+        cv.put("invoice_status", rec.invoiceStatus != null ? rec.invoiceStatus : "NONE");
+        cv.put("invoice_qr_left", rec.invoiceQrLeft != null ? rec.invoiceQrLeft : "");
+        cv.put("invoice_qr_right", rec.invoiceQrRight != null ? rec.invoiceQrRight : "");
+        cv.put("payment_tx_id", rec.paymentTxId != null ? rec.paymentTxId : "");
+        cv.put("payment_provider", rec.paymentProvider != null ? rec.paymentProvider : "");
         long rowId = db.insert("orders", null, cv);
         rec.dbId = rowId;
         return rowId;
+    }
+
+    public void updateOrderInvoice(MainActivity.OrderRecord rec) {
+        if (rec == null || rec.dbId <= 0) return;
+        SQLiteDatabase db = getWritableDatabase();
+        ContentValues cv = new ContentValues();
+        cv.put("invoice_no", rec.invoiceNo != null ? rec.invoiceNo : "");
+        cv.put("invoice_period", rec.invoicePeriod != null ? rec.invoicePeriod : "");
+        cv.put("invoice_random", rec.invoiceRandom != null ? rec.invoiceRandom : "");
+        cv.put("invoice_status", rec.invoiceStatus != null ? rec.invoiceStatus : "NONE");
+        cv.put("invoice_qr_left", rec.invoiceQrLeft != null ? rec.invoiceQrLeft : "");
+        cv.put("invoice_qr_right", rec.invoiceQrRight != null ? rec.invoiceQrRight : "");
+        db.update("orders", cv, "id = ?", new String[]{String.valueOf(rec.dbId)});
     }
 
     public void markOrderVoided(long dbId, boolean voided) {
@@ -317,7 +372,10 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
         try {
             c = db.rawQuery("SELECT id, call_num, order_time, order_type, items_json, "
                 + "order_discount, total, payment_method, cash_received, cash_change, "
-                + "print_receipt, sticker_count, voided, staff_name FROM orders WHERE closed = 0 ORDER BY id DESC", null);
+                + "print_receipt, sticker_count, voided, staff_name, "
+                + "invoice_no, invoice_period, invoice_random, buyer_tax_id, carrier_type, carrier_code, "
+                + "invoice_status, invoice_qr_left, invoice_qr_right, payment_tx_id, payment_provider "
+                + "FROM orders WHERE closed = 0 ORDER BY id DESC", null);
             while (c.moveToNext()) {
                 MainActivity.OrderRecord r = new MainActivity.OrderRecord();
                 r.dbId = c.getLong(0);
@@ -334,6 +392,17 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
                 r.stickerCount = c.getInt(11);
                 r.voided = c.getInt(12) == 1;
                 r.staffName = c.getString(13);
+                r.invoiceNo = c.getString(14);
+                r.invoicePeriod = c.getString(15);
+                r.invoiceRandom = c.getString(16);
+                r.buyerTaxId = c.getString(17);
+                r.carrierType = c.getString(18);
+                r.carrierCode = c.getString(19);
+                r.invoiceStatus = c.getString(20);
+                r.invoiceQrLeft = c.getString(21);
+                r.invoiceQrRight = c.getString(22);
+                r.paymentTxId = c.getString(23);
+                r.paymentProvider = c.getString(24);
                 res.add(r);
             }
         } catch (Exception ignored) {
@@ -583,13 +652,17 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
             }
 
             writer.write("\r\n【當日訂單明細】\r\n");
-            writer.write("取餐號,時間,用餐類型,狀態,付款方式,整單折扣,總金額,餐點內容與客製明細\r\n");
+            writer.write("取餐號,時間,用餐類型,狀態,付款方式,交易序號,發票號碼,買方統編,載具,整單折扣,總金額,餐點內容與客製明細\r\n");
             for (MainActivity.OrderRecord o : orders) {
                 writer.write(csvEscape(o.callNum) + ","
                     + csvEscape(o.time) + ","
                     + csvEscape(o.orderType) + ","
                     + (o.voided ? "已作廢(VOID)" : "有效") + ","
                     + csvEscape(o.paymentMethod) + ","
+                    + csvEscape(o.paymentTxId) + ","
+                    + csvEscape(o.invoiceNo) + ","
+                    + csvEscape(o.buyerTaxId) + ","
+                    + csvEscape(o.carrierCode) + ","
                     + o.orderDiscount + ","
                     + o.total + ","
                     + csvEscape(buildItemsSummary(o.items)) + "\r\n");
@@ -917,6 +990,17 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
                 oo.put("stickerCount", o.stickerCount);
                 oo.put("voided", o.voided);
                 oo.put("staffName", o.staffName != null ? o.staffName : "");
+                oo.put("invoiceNo", o.invoiceNo != null ? o.invoiceNo : "");
+                oo.put("invoicePeriod", o.invoicePeriod != null ? o.invoicePeriod : "");
+                oo.put("invoiceRandom", o.invoiceRandom != null ? o.invoiceRandom : "");
+                oo.put("buyerTaxId", o.buyerTaxId != null ? o.buyerTaxId : "");
+                oo.put("carrierType", o.carrierType != null ? o.carrierType : "PAPER");
+                oo.put("carrierCode", o.carrierCode != null ? o.carrierCode : "");
+                oo.put("invoiceStatus", o.invoiceStatus != null ? o.invoiceStatus : "NONE");
+                oo.put("invoiceQrLeft", o.invoiceQrLeft != null ? o.invoiceQrLeft : "");
+                oo.put("invoiceQrRight", o.invoiceQrRight != null ? o.invoiceQrRight : "");
+                oo.put("paymentTxId", o.paymentTxId != null ? o.paymentTxId : "");
+                oo.put("paymentProvider", o.paymentProvider != null ? o.paymentProvider : "");
                 activeOrdArr.put(oo);
             }
             root.put("activeOrders", activeOrdArr);
@@ -1084,6 +1168,17 @@ public class PosDatabaseHelper extends SQLiteOpenHelper {
                     cv.put("closed", 0);
                     cv.put("synced", 0);
                     cv.put("staff_name", oo.optString("staffName", ""));
+                    cv.put("invoice_no", oo.optString("invoiceNo", ""));
+                    cv.put("invoice_period", oo.optString("invoicePeriod", ""));
+                    cv.put("invoice_random", oo.optString("invoiceRandom", ""));
+                    cv.put("buyer_tax_id", oo.optString("buyerTaxId", ""));
+                    cv.put("carrier_type", oo.optString("carrierType", "PAPER"));
+                    cv.put("carrier_code", oo.optString("carrierCode", ""));
+                    cv.put("invoice_status", oo.optString("invoiceStatus", "NONE"));
+                    cv.put("invoice_qr_left", oo.optString("invoiceQrLeft", ""));
+                    cv.put("invoice_qr_right", oo.optString("invoiceQrRight", ""));
+                    cv.put("payment_tx_id", oo.optString("paymentTxId", ""));
+                    cv.put("payment_provider", oo.optString("paymentProvider", ""));
                     db.insert("orders", null, cv);
                     restoredOrders++;
                 }

@@ -17,6 +17,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
+import android.view.inputmethod.EditorInfo;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
@@ -25,6 +26,7 @@ import android.widget.CompoundButton;
 import android.widget.EditText;
 import android.widget.GridLayout;
 import android.widget.HorizontalScrollView;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
@@ -220,6 +222,17 @@ public class MainActivity extends Activity {
         public int stickerCount;
         public boolean voided = false;
         public String staffName = "";
+        public String invoiceNo = "";
+        public String invoicePeriod = "";
+        public String invoiceRandom = "";
+        public String buyerTaxId = "";
+        public String carrierType = "PAPER";
+        public String carrierCode = "";
+        public String invoiceStatus = "NONE";
+        public String invoiceQrLeft = "";
+        public String invoiceQrRight = "";
+        public String paymentTxId = "";
+        public String paymentProvider = "";
         public transient boolean triggerCashDrawer = false;
     }
 
@@ -629,6 +642,7 @@ public class MainActivity extends Activity {
 
         closingHistory.clear();
         closingHistory.addAll(dbHelper.loadClosingHistory());
+        TaiwanCommerceGateway.loadFromDb(dbHelper);
         refreshLicenseState();
         return isFirstFreshInstall;
     }
@@ -3021,7 +3035,7 @@ public class MainActivity extends Activity {
             return;
         }
         final int due = getCartGrandTotal();
-        final String[] payMethods = {"現金", "信用卡", "LINE Pay", "街口支付", "UberEats", "Foodpanda"};
+        final String[] payMethods = {"現金", "信用卡", "LINE Pay", "街口支付", "TWQR 掃碼", "UberEats", "Foodpanda"};
         final String[] selPay = {
             ("UberEats".equals(currentOrderType) || "Foodpanda".equals(currentOrderType)) ? currentOrderType : "現金"
         };
@@ -3033,7 +3047,7 @@ public class MainActivity extends Activity {
 
         int chkGridW = (int) (getResources().getDisplayMetrics().widthPixels * 0.72f) - dp(40);
         addSectionHeader(box, "1. 選擇付款方式：");
-        addGridSingleSelect(box, payMethods, selPay, 3, chkGridW, null);
+        addGridSingleSelect(box, payMethods, selPay, 4, chkGridW, null);
 
         addSectionHeader(box, "2. 應收金額：$" + due + "  (若收現金可點快速面額算找零)");
         final EditText etCash = new EditText(this);
@@ -3068,12 +3082,74 @@ public class MainActivity extends Activity {
         }
         box.addView(quickCashRow);
 
+        // 3. 台灣電子發票選項（僅於設定頁啟用電子發票時顯示）
+        final boolean invEnabled = TaiwanCommerceGateway.invoiceCfg.enabled
+            && (licenseState == null || licenseState.hasFeature(LicenseManager.FEATURE_EINVOICE));
+        final String[] selCarrierType = {TaiwanCommerceGateway.CARRIER_PAPER};
+        final EditText etBuyerTaxId = new EditText(this);
+        final EditText etCarrierCode = new EditText(this);
+        if (invEnabled) {
+            addSectionHeader(box, "3. 台灣電子發票 ("
+                + (TaiwanCommerceGateway.INV_MODE_WEBHOOK.equals(TaiwanCommerceGateway.invoiceCfg.mode) ? "正式中繼" : "測試模擬")
+                + ")：");
+            LinearLayout invOptRow = new LinearLayout(this);
+            invOptRow.setOrientation(LinearLayout.HORIZONTAL);
+            invOptRow.setGravity(Gravity.CENTER_VERTICAL);
+
+            final Button btnCarrierMode = new Button(this);
+            btnCarrierMode.setText("🧾 紙本證明聯");
+            btnCarrierMode.setAllCaps(false);
+            btnCarrierMode.setTextSize(12);
+            btnCarrierMode.setTextColor(Color.WHITE);
+            btnCarrierMode.setBackground(roundBg(Color.parseColor("#0F766E"), 0, 0, 6));
+
+            etCarrierCode.setHint("載具 / 愛心碼");
+            etCarrierCode.setTextColor(Color.WHITE);
+            etCarrierCode.setHintTextColor(Color.parseColor("#94A3B8"));
+            etCarrierCode.setTextSize(12);
+            etCarrierCode.setVisibility(View.GONE);
+
+            btnCarrierMode.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    if (TaiwanCommerceGateway.CARRIER_PAPER.equals(selCarrierType[0])) {
+                        selCarrierType[0] = TaiwanCommerceGateway.CARRIER_MOBILE;
+                        btnCarrierMode.setText("📱 手機條碼");
+                        etCarrierCode.setHint("輸入 /XXXXXXX (8碼)");
+                        etCarrierCode.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);
+                        etCarrierCode.setVisibility(View.VISIBLE);
+                    } else if (TaiwanCommerceGateway.CARRIER_MOBILE.equals(selCarrierType[0])) {
+                        selCarrierType[0] = TaiwanCommerceGateway.CARRIER_DONATE;
+                        btnCarrierMode.setText("❤️ 捐贈愛心碼");
+                        etCarrierCode.setHint("輸入 3~7 碼愛心碼");
+                        etCarrierCode.setInputType(InputType.TYPE_CLASS_NUMBER);
+                        etCarrierCode.setVisibility(View.VISIBLE);
+                    } else {
+                        selCarrierType[0] = TaiwanCommerceGateway.CARRIER_PAPER;
+                        btnCarrierMode.setText("🧾 紙本證明聯");
+                        etCarrierCode.setText("");
+                        etCarrierCode.setVisibility(View.GONE);
+                    }
+                }
+            });
+            invOptRow.addView(btnCarrierMode, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(36)));
+            invOptRow.addView(etCarrierCode, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.1f));
+
+            etBuyerTaxId.setHint("買方統編(8碼選填)");
+            etBuyerTaxId.setInputType(InputType.TYPE_CLASS_NUMBER);
+            etBuyerTaxId.setTextColor(Color.WHITE);
+            etBuyerTaxId.setHintTextColor(Color.parseColor("#94A3B8"));
+            etBuyerTaxId.setTextSize(12);
+            invOptRow.addView(etBuyerTaxId, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            box.addView(invOptRow);
+        }
+
         int sCount = getTotalStickersCount();
         TextView tvPrintInfo = new TextView(this);
         tvPrintInfo.setText("🖨️ 出單設定："
-            + (globalPrintReceipt ? "✅ 印 HPRT TP805L 收據單" : "❌ 不印收據")
+            + (globalPrintReceipt ? "✅ 印收據" : "❌ 不印收據")
+            + (invEnabled ? " + 電子發票" : "")
             + " ｜ "
-            + (sCount > 0 ? "✅ 印 GoDEX DT2x 貼紙共 " + sCount + " 張" : "❌ 不印貼紙"));
+            + (sCount > 0 ? "✅ 印貼紙共 " + sCount + " 張" : "❌ 不印貼紙"));
         tvPrintInfo.setTextColor(Color.parseColor("#93C5FD"));
         tvPrintInfo.setTextSize(13);
         tvPrintInfo.setPadding(0, dp(8), dp(0), dp(8));
@@ -3101,9 +3177,12 @@ public class MainActivity extends Activity {
         actionRow.addView(btnFinish, new LinearLayout.LayoutParams(0, dp(44), 1f));
         box.addView(actionRow);
 
+        ScrollView svBox = new ScrollView(this);
+        svBox.addView(box);
+
         final AlertDialog dialog = new AlertDialog.Builder(this)
             .setTitle("💰 結帳收款｜取餐號 " + formatCallNum(callSequence))
-            .setView(box)
+            .setView(svBox)
             .create();
 
         if (dialog.getWindow() != null) {
@@ -3118,42 +3197,214 @@ public class MainActivity extends Activity {
             @Override public void onClick(View v) {
                 int cashRec = due;
                 try { cashRec = Integer.parseInt(etCash.getText().toString().trim()); } catch (Exception ignored) {}
-                final OrderRecord rec = new OrderRecord();
-                rec.callNum = formatCallNum(callSequence);
-                rec.time = new SimpleDateFormat("HH:mm", Locale.TAIWAN).format(new Date());
-                rec.orderType = "內用".equals(currentOrderType) ? "內用(" + currentTable + ")" : currentOrderType;
-                for (CartItem ci : cart) rec.items.add(ci);
-                rec.orderDiscount = orderDiscount;
-                rec.total = due;
-                rec.paymentMethod = selPay[0];
-                rec.cashReceived = cashRec;
-                rec.cashChange = Math.max(0, cashRec - due);
-                rec.printReceipt = globalPrintReceipt;
-                rec.stickerCount = getTotalStickersCount();
-                rec.staffName = staffModeEnabled ? currentStaffName : "";
-                rec.triggerCashDrawer = PosPrintEngine.autoOpenCashDrawerOnCash
-                    && "現金".equals(rec.paymentMethod)
-                    && (licenseState == null || licenseState.hasFeature(LicenseManager.FEATURE_CASH_DRAWER));
+                final String buyerTax = invEnabled ? etBuyerTaxId.getText().toString().trim() : "";
+                final String cType = invEnabled ? selCarrierType[0] : TaiwanCommerceGateway.CARRIER_PAPER;
+                final String cCode = invEnabled ? etCarrierCode.getText().toString().trim().toUpperCase(Locale.US) : "";
 
-                // 寫入本地 SQLite 資料庫並持久化下一單取餐號
-                dbHelper.insertOrder(rec);
-                ordersHistory.add(0, rec);
-                callSequence++;
-                dbHelper.setSetting("call_sequence", String.valueOf(callSequence));
-                tvTopCallNum.setText("取餐號 " + formatCallNum(callSequence));
-                updateOrdersBadge();
+                if (invEnabled) {
+                    if (!buyerTax.isEmpty() && !TaiwanCommerceGateway.isValidTaiwanTaxId(buyerTax)) {
+                        Toast.makeText(MainActivity.this, "❌ 買方統一編號檢查碼錯誤 (須為正確 8 碼)", Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    if (TaiwanCommerceGateway.CARRIER_MOBILE.equals(cType) && !TaiwanCommerceGateway.isValidMobileBarcode(cCode)) {
+                        Toast.makeText(MainActivity.this, "❌ 手機條碼格式錯誤 (範例 /AB12+34)", Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    if (TaiwanCommerceGateway.CARRIER_DONATE.equals(cType) && !TaiwanCommerceGateway.isValidDonateCode(cCode)) {
+                        Toast.makeText(MainActivity.this, "❌ 捐贈愛心碼須為 3~7 碼數字", Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                }
 
-                cart.clear();
-                orderDiscount = 0;
-                refreshCartUI();
+                final String payMethod = selPay[0];
+                final int finalCashRec = cashRec;
                 dialog.dismiss();
 
-                // 顯示出單預覽並同步發送 TCP Port 9100 列印指令至 HPRT TP805L 與 GoDEX DT2x
-                showPrintPreviewAndDispatch(rec, true);
+                if (TaiwanCommerceGateway.isDigitalPaymentConfigured(payMethod)
+                    && ensureFeatureAllowed(LicenseManager.FEATURE_MULTI_PAY, "多元電子支付 API 收款")) {
+                    showDigitalPaymentCollectDialog(payMethod, due, formatCallNum(callSequence),
+                        new TaiwanCommerceGateway.PaymentCallback() {
+                            @Override public void onResult(TaiwanCommerceGateway.PaymentResult res) {
+                                if (res.success) {
+                                    Toast.makeText(MainActivity.this, res.message, Toast.LENGTH_SHORT).show();
+                                    finalizeOrderCheckout(due, payMethod, finalCashRec, buyerTax, cType, cCode, res.txId);
+                                }
+                            }
+                        });
+                } else {
+                    finalizeOrderCheckout(due, payMethod, finalCashRec, buyerTax, cType, cCode, "");
+                }
             }
         });
 
         dialog.show();
+    }
+
+    private void showDigitalPaymentCollectDialog(final String method, final int amount, final String callNum,
+                                                 final TaiwanCommerceGateway.PaymentCallback onPaid) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackgroundColor(Color.parseColor("#0F172A"));
+        box.setPadding(dp(16), dp(12), dp(16), dp(12));
+
+        TextView tvAmt = new TextView(this);
+        tvAmt.setText("💳 " + method + " 待收金額：$" + amount + " (" + callNum + ")");
+        tvAmt.setTextColor(Color.parseColor("#FCD34D"));
+        tvAmt.setTextSize(17);
+        tvAmt.setTypeface(null, Typeface.BOLD);
+        tvAmt.setPadding(0, 0, 0, dp(8));
+        box.addView(tvAmt);
+
+        if ("TWQR 掃碼".equals(method)) {
+            String twqrStr = TaiwanCommerceGateway.buildTwqrScanString(amount, callNum);
+            ImageView iv = new ImageView(this);
+            iv.setImageBitmap(QrCodeGenerator.generateQrBitmap(twqrStr, 340));
+            LinearLayout.LayoutParams lpIv = new LinearLayout.LayoutParams(dp(240), dp(240));
+            lpIv.gravity = Gravity.CENTER_HORIZONTAL;
+            box.addView(iv, lpIv);
+
+            TextView tvHint = new TextView(this);
+            tvHint.setText("請顧客開啟任一台灣行動支付 / 網銀 App 掃描上方 TWQR 收款碼後，點擊「確認已入帳」。");
+            tvHint.setTextColor(Color.parseColor("#CBD5E1"));
+            tvHint.setTextSize(12);
+            tvHint.setPadding(0, dp(8), 0, 0);
+            box.addView(tvHint);
+
+            new AlertDialog.Builder(this)
+                .setTitle("📱 TWQR 共通掃碼收款")
+                .setView(box)
+                .setNegativeButton("取消收款", null)
+                .setPositiveButton("✅ 已確認收到款項 ($" + amount + ")", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface d, int w) {
+                        TaiwanCommerceGateway.processDigitalPaymentAsync(method, amount, callNum, "", onPaid);
+                    }
+                })
+                .show();
+            return;
+        }
+
+        final EditText etBarcode = new EditText(this);
+        etBarcode.setHint("請用掃碼槍掃入顧客 " + method + " 條碼 (支援 USB/藍牙條碼槍)");
+        etBarcode.setTextColor(Color.WHITE);
+        etBarcode.setHintTextColor(Color.parseColor("#94A3B8"));
+        etBarcode.setSingleLine(true);
+        etBarcode.setImeOptions(EditorInfo.IME_ACTION_DONE);
+        box.addView(etBarcode);
+
+        final TextView tvStatus = new TextView(this);
+        tvStatus.setText("等待掃描付款碼...");
+        tvStatus.setTextColor(Color.parseColor("#93C5FD"));
+        tvStatus.setTextSize(12);
+        tvStatus.setPadding(0, dp(6), 0, dp(6));
+        box.addView(tvStatus);
+
+        final AlertDialog dlg = new AlertDialog.Builder(this)
+            .setTitle("📱 " + method + " 掃碼收款")
+            .setView(box)
+            .setNegativeButton("取消", null)
+            .setNeutralButton("🧪 模擬測試掃碼", null)
+            .setPositiveButton("⚡ 送出扣款", null)
+            .create();
+
+        dlg.setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override public void onShow(DialogInterface d) {
+                final Runnable submitPay = new Runnable() {
+                    @Override public void run() {
+                        String code = etBarcode.getText().toString().trim();
+                        tvStatus.setText("⏳ 正在呼叫 " + method + " API 授權中...");
+                        TaiwanCommerceGateway.processDigitalPaymentAsync(method, amount, callNum, code,
+                            new TaiwanCommerceGateway.PaymentCallback() {
+                                @Override public void onResult(TaiwanCommerceGateway.PaymentResult res) {
+                                    if (res.success) {
+                                        dlg.dismiss();
+                                        onPaid.onResult(res);
+                                    } else {
+                                        tvStatus.setText(res.message);
+                                        tvStatus.setTextColor(Color.parseColor("#FCA5A5"));
+                                    }
+                                }
+                            });
+                    }
+                };
+                dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View v) { submitPay.run(); }
+                });
+                dlg.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View v) {
+                        etBarcode.setText("9900" + (10000000000000L + (System.currentTimeMillis() % 89999999999999L)));
+                        submitPay.run();
+                    }
+                });
+                etBarcode.setOnEditorActionListener(new android.widget.TextView.OnEditorActionListener() {
+                    @Override public boolean onEditorAction(android.widget.TextView tv, int actionId, android.view.KeyEvent event) {
+                        submitPay.run();
+                        return true;
+                    }
+                });
+            }
+        });
+        dlg.show();
+    }
+
+    private void finalizeOrderCheckout(int due, String payMethod, int cashRec,
+                                       String buyerTaxId, String carrierType, String carrierCode,
+                                       String paymentTxId) {
+        final OrderRecord rec = new OrderRecord();
+        rec.callNum = formatCallNum(callSequence);
+        rec.time = new SimpleDateFormat("HH:mm", Locale.TAIWAN).format(new Date());
+        rec.orderType = "內用".equals(currentOrderType) ? "內用(" + currentTable + ")" : currentOrderType;
+        for (CartItem ci : cart) rec.items.add(ci);
+        rec.orderDiscount = orderDiscount;
+        rec.total = due;
+        rec.paymentMethod = payMethod;
+        rec.cashReceived = cashRec;
+        rec.cashChange = Math.max(0, cashRec - due);
+        rec.printReceipt = globalPrintReceipt;
+        rec.stickerCount = getTotalStickersCount();
+        rec.staffName = staffModeEnabled ? currentStaffName : "";
+        rec.buyerTaxId = buyerTaxId != null ? buyerTaxId : "";
+        rec.carrierType = carrierType != null ? carrierType : TaiwanCommerceGateway.CARRIER_PAPER;
+        rec.carrierCode = carrierCode != null ? carrierCode : "";
+        rec.paymentTxId = paymentTxId != null ? paymentTxId : "";
+        rec.paymentProvider = (paymentTxId != null && !paymentTxId.isEmpty()) ? payMethod : "";
+        rec.triggerCashDrawer = PosPrintEngine.autoOpenCashDrawerOnCash
+            && "現金".equals(rec.paymentMethod)
+            && (licenseState == null || licenseState.hasFeature(LicenseManager.FEATURE_CASH_DRAWER));
+
+        dbHelper.insertOrder(rec);
+        ordersHistory.add(0, rec);
+        callSequence++;
+        dbHelper.setSetting("call_sequence", String.valueOf(callSequence));
+        tvTopCallNum.setText("取餐號 " + formatCallNum(callSequence));
+        updateOrdersBadge();
+
+        cart.clear();
+        orderDiscount = 0;
+        refreshCartUI();
+
+        if (TaiwanCommerceGateway.invoiceCfg.enabled
+            && (licenseState == null || licenseState.hasFeature(LicenseManager.FEATURE_EINVOICE))) {
+            Toast.makeText(this, "🧾 正在開立電子發票並準備出單...", Toast.LENGTH_SHORT).show();
+            TaiwanCommerceGateway.issueEinvoiceAsync(dbHelper, rec, new TaiwanCommerceGateway.InvoiceCallback() {
+                @Override public void onResult(TaiwanCommerceGateway.InvoiceResult res) {
+                    if (res.success) {
+                        rec.invoiceNo = res.invoiceNo;
+                        rec.invoicePeriod = res.period;
+                        rec.invoiceRandom = res.randomCode;
+                        rec.invoiceQrLeft = res.qrLeft;
+                        rec.invoiceQrRight = res.qrRight;
+                        rec.invoiceStatus = res.status;
+                    } else {
+                        rec.invoiceStatus = res.status;
+                        Toast.makeText(MainActivity.this, res.message, Toast.LENGTH_LONG).show();
+                    }
+                    dbHelper.updateOrderInvoice(rec);
+                    showPrintPreviewAndDispatch(rec, true);
+                }
+            });
+        } else {
+            showPrintPreviewAndDispatch(rec, true);
+        }
     }
 
     private void updateOrdersBadge() {
@@ -3188,6 +3439,20 @@ public class MainActivity extends Activity {
                 sb.append("整單折扣：-$").append(order.orderDiscount).append("\n");
             }
             sb.append("應收總計 (").append(order.paymentMethod).append(")：$").append(order.total).append("\n");
+            if (order.paymentTxId != null && !order.paymentTxId.trim().isEmpty()) {
+                sb.append("支付交易序號：").append(order.paymentTxId).append("\n");
+            }
+            if (order.invoiceNo != null && !order.invoiceNo.trim().isEmpty()) {
+                sb.append("電子發票：").append(order.invoiceNo)
+                  .append(" (").append(order.invoicePeriod).append(" / 隨機碼:").append(order.invoiceRandom).append(")")
+                  .append(" [").append(order.invoiceStatus).append("]\n");
+                if (order.buyerTaxId != null && !order.buyerTaxId.isEmpty()) {
+                    sb.append("買方統編：").append(order.buyerTaxId).append("\n");
+                }
+                if (order.carrierCode != null && !order.carrierCode.isEmpty()) {
+                    sb.append("載具/愛心碼：").append(order.carrierCode).append("\n");
+                }
+            }
             if ("現金".equals(order.paymentMethod)) {
                 sb.append("實收：$").append(order.cashReceived).append("  找零：$").append(order.cashChange).append("\n");
             }
@@ -3330,10 +3595,19 @@ public class MainActivity extends Activity {
             }
 
             TextView tvInfo = new TextView(this);
+            StringBuilder extraMeta = new StringBuilder();
+            if (o.invoiceNo != null && !o.invoiceNo.isEmpty()) {
+                extraMeta.append(" ｜ 🧾").append(o.invoiceNo);
+                if ("VOIDED".equals(o.invoiceStatus)) extraMeta.append("(已作廢)");
+                else if ("SANDBOX".equals(o.invoiceStatus)) extraMeta.append("(模擬)");
+            }
+            if (o.paymentTxId != null && !o.paymentTxId.isEmpty()) {
+                extraMeta.append(" ｜ 💳").append(o.paymentTxId);
+            }
             tvInfo.setText(o.callNum + " [" + o.orderType + "] " + o.time
                 + ((o.staffName != null && !o.staffName.isEmpty()) ? " 👤" + o.staffName : "")
                 + (o.voided ? " (❌已作廢)" : " (✅有效)")
-                + "\n" + desc.toString() + " ｜ " + o.paymentMethod + " $" + o.total);
+                + "\n" + desc.toString() + " ｜ " + o.paymentMethod + " $" + o.total + extraMeta.toString());
             tvInfo.setTextColor(o.voided ? Color.parseColor("#EF4444") : Color.WHITE);
             tvInfo.setTextSize(13);
             card.addView(tvInfo, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
@@ -3346,6 +3620,23 @@ public class MainActivity extends Activity {
                 @Override public void onClick(View v) { showPrintPreviewAndDispatch(o, false); }
             });
             card.addView(btnPreview);
+
+            if (o.invoiceNo != null && !o.invoiceNo.isEmpty()) {
+                Button btnProofBmp = new Button(this);
+                btnProofBmp.setText("🧾 證明聯");
+                btnProofBmp.setAllCaps(false);
+                btnProofBmp.setTextSize(12);
+                btnProofBmp.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View v) {
+                        android.graphics.Bitmap proof = PosPrintEngine.renderEinvoiceProofBitmap(o, receiptWidthMm);
+                        showBitmapPreviewDialog("🧾 電子發票證明聯預覽 (" + o.invoiceNo + ")", proof);
+                    }
+                });
+                LinearLayout.LayoutParams lpPr = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                lpPr.leftMargin = dp(4);
+                card.addView(btnProofBmp, lpPr);
+            }
 
             Button btnReprintRec = new Button(this);
             btnReprintRec.setText("🧾 補印收據");
@@ -3400,6 +3691,16 @@ public class MainActivity extends Activity {
                             @Override public void run() {
                                 o.voided = true;
                                 if (o.dbId > 0) dbHelper.markOrderVoided(o.dbId, true);
+                                if (o.invoiceNo != null && !o.invoiceNo.isEmpty() && !"VOIDED".equals(o.invoiceStatus)) {
+                                    TaiwanCommerceGateway.voidEinvoiceAsync(o, new TaiwanCommerceGateway.InvoiceCallback() {
+                                        @Override public void onResult(TaiwanCommerceGateway.InvoiceResult res) {
+                                            o.invoiceStatus = res.status;
+                                            dbHelper.updateOrderInvoice(o);
+                                            Toast.makeText(MainActivity.this, res.message, Toast.LENGTH_LONG).show();
+                                            rebuildOrdersTab();
+                                        }
+                                    });
+                                }
                                 if (auditLogEnabled || staffModeEnabled) {
                                     dbHelper.insertAuditLog(
                                         staffModeEnabled ? currentStaffName : "店長",
@@ -4479,6 +4780,54 @@ public class MainActivity extends Activity {
             ViewGroup.LayoutParams.MATCH_PARENT, dp(42));
         lpQrSet.topMargin = dp(8);
         box.addView(btnOpenQrCenterInSettings, lpQrSet);
+
+        // 3C. 台灣電子發票與多元支付閘道設定 (LINE Pay / 街口 / TWQR / 加值中心預留)
+        addSectionHeader(box, "💳 3C. 台灣電子發票與多元支付閘道設定 (LINE Pay / 街口 / TWQR / 加值中心預留)");
+        LinearLayout twPayPanel = new LinearLayout(this);
+        twPayPanel.setOrientation(LinearLayout.VERTICAL);
+        twPayPanel.setBackground(roundBg(Color.parseColor("#1E293B"), Color.parseColor("#334155"), 1, 8));
+        twPayPanel.setPadding(dp(10), dp(8), dp(10), dp(8));
+
+        TextView tvTwPaySummary = new TextView(this);
+        String invSummary = TaiwanCommerceGateway.invoiceCfg.enabled
+            ? ("✅ 已啟用 ("
+                + (TaiwanCommerceGateway.INV_MODE_WEBHOOK.equals(TaiwanCommerceGateway.invoiceCfg.mode) ? "加值中心中繼" : "本機模擬字軌")
+                + (TaiwanCommerceGateway.invoiceCfg.sellerTaxId.isEmpty() ? "" : "｜統編 " + TaiwanCommerceGateway.invoiceCfg.sellerTaxId)
+                + ")")
+            : "⚪ 未啟用（免用統一發票小店適用）";
+        String paySummary = "LINE Pay[" + TaiwanCommerceGateway.paymentCfg.linePayMode
+            + "] ｜ 街口[" + TaiwanCommerceGateway.paymentCfg.jkoPayMode
+            + "] ｜ TWQR[" + (TaiwanCommerceGateway.paymentCfg.twqrEnabled ? "ON" : "OFF") + "]";
+        tvTwPaySummary.setText("🧾 電子發票：" + invSummary + "\n📱 多元支付：" + paySummary);
+        tvTwPaySummary.setTextColor(Color.parseColor("#E2E8F0"));
+        tvTwPaySummary.setTextSize(12);
+        tvTwPaySummary.setPadding(0, 0, 0, dp(6));
+        twPayPanel.addView(tvTwPaySummary);
+
+        LinearLayout twBtnRow = new LinearLayout(this);
+        twBtnRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button btnCfgEinvoice = makeMiniTuneBtn("🧾 設定台灣電子發票 / 統編 / 加值中心", new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (!ensureFeatureAllowed(LicenseManager.FEATURE_EINVOICE, "台灣電子發票整合")) return;
+                showEinvoiceSettingsDialog();
+            }
+        });
+        btnCfgEinvoice.setBackground(roundBg(Color.parseColor("#0F766E"), 0, 0, 6));
+        LinearLayout.LayoutParams lpEi = new LinearLayout.LayoutParams(0, dp(36), 1f);
+        lpEi.rightMargin = dp(6);
+        twBtnRow.addView(btnCfgEinvoice, lpEi);
+
+        Button btnCfgMultiPay = makeMiniTuneBtn("📱 設定 LINE Pay / 街口 / TWQR", new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (!ensureFeatureAllowed(LicenseManager.FEATURE_MULTI_PAY, "多元電子支付閘道")) return;
+                showMultiPaymentSettingsDialog();
+            }
+        });
+        btnCfgMultiPay.setBackground(roundBg(Color.parseColor("#1D4ED8"), 0, 0, 6));
+        twBtnRow.addView(btnCfgMultiPay, new LinearLayout.LayoutParams(0, dp(36), 1f));
+        twPayPanel.addView(twBtnRow);
+        box.addView(twPayPanel);
 
         // 3B. 店家私人 Google Drive 完整備份 / 一鍵回復系統 / 系統 OTA 更新 / 店長 PIN 碼
         addSectionHeader(box, "🛡️ 3B. 店家雲端硬碟備份、一鍵回復系統、OTA 遠端更新與權限鎖");
@@ -6009,7 +6358,7 @@ public class MainActivity extends Activity {
             + "• 目前方案：" + licenseState.planLabel + "\n"
             + "• 目前狀態：" + licenseState.statusSummary + "\n"
             + "• 已解鎖功能模組：" + licenseState.enabledFeatures
-            + "\n\n【模組代碼說明】core=基礎收銀出單｜qr=手機掃碼點餐｜cloud_backup=雲端硬碟備份｜staff=員工交班稽核｜cash_drawer=錢櫃彈開");
+            + "\n\n【模組代碼說明】core=基礎收銀出單｜qr=手機掃碼點餐｜cloud_backup=雲端硬碟備份｜staff=員工交班稽核｜cash_drawer=錢櫃彈開｜einvoice=電子發票｜multi_pay=多元支付");
         tvInfo.setTextSize(13);
         tvInfo.setPadding(0, 0, 0, dp(10));
         box.addView(tvInfo);
@@ -6054,6 +6403,212 @@ public class MainActivity extends Activity {
                             .setPositiveButton("確定", null)
                             .show();
                     }
+                }
+            })
+            .show();
+    }
+
+    private void showEinvoiceSettingsDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(10), dp(16), dp(10));
+
+        final CheckBox cbEnabled = new CheckBox(this);
+        cbEnabled.setText("✅ 啟用結帳開立台灣電子發票（免開發票小店維持不勾選即可）");
+        cbEnabled.setChecked(TaiwanCommerceGateway.invoiceCfg.enabled);
+        box.addView(cbEnabled);
+
+        final CheckBox cbPrintWithCarrier = new CheckBox(this);
+        cbPrintWithCarrier.setText("使用手機條碼 / 愛心碼時仍列印紙本證明聯（預設無紙化不印）");
+        cbPrintWithCarrier.setChecked(TaiwanCommerceGateway.invoiceCfg.printProofWithCarrier);
+        box.addView(cbPrintWithCarrier);
+
+        final String[] modeChoice = {TaiwanCommerceGateway.invoiceCfg.mode};
+        final Button btnMode = new Button(this);
+        btnMode.setAllCaps(false);
+        btnMode.setText(TaiwanCommerceGateway.INV_MODE_WEBHOOK.equals(modeChoice[0])
+            ? "🌐 模式：通用加值中心 Webhook 中繼（不綁定單一平台）"
+            : "🧪 模式：本機模擬 Sandbox 字軌（免金鑰直接測證明聯排版）");
+        btnMode.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                modeChoice[0] = TaiwanCommerceGateway.INV_MODE_WEBHOOK.equals(modeChoice[0])
+                    ? TaiwanCommerceGateway.INV_MODE_SANDBOX
+                    : TaiwanCommerceGateway.INV_MODE_WEBHOOK;
+                btnMode.setText(TaiwanCommerceGateway.INV_MODE_WEBHOOK.equals(modeChoice[0])
+                    ? "🌐 模式：通用加值中心 Webhook 中繼（不綁定單一平台）"
+                    : "🧪 模式：本機模擬 Sandbox 字軌（免金鑰直接測證明聯排版）");
+            }
+        });
+        box.addView(btnMode);
+
+        final EditText etTaxId = new EditText(this);
+        etTaxId.setHint("賣方 8 碼統一編號 (例 12345675)");
+        etTaxId.setInputType(InputType.TYPE_CLASS_NUMBER);
+        etTaxId.setText(TaiwanCommerceGateway.invoiceCfg.sellerTaxId);
+        box.addView(etTaxId);
+
+        final EditText etTrack = new EditText(this);
+        etTrack.setHint("模擬字軌前綴 (2 碼大寫英文，預設 TW)");
+        etTrack.setText(TaiwanCommerceGateway.invoiceCfg.trackPrefix);
+        box.addView(etTrack);
+
+        final EditText etRelay = new EditText(this);
+        etRelay.setHint("加值中心 Webhook URL (預留：綠界/藍新/關貿或店家自架中繼)");
+        etRelay.setText(TaiwanCommerceGateway.invoiceCfg.relayUrl);
+        box.addView(etRelay);
+
+        final EditText etMerch = new EditText(this);
+        etMerch.setHint("加值中心商店代號 Merchant ID (選填)");
+        etMerch.setText(TaiwanCommerceGateway.invoiceCfg.merchantId);
+        box.addView(etMerch);
+
+        final EditText etApiKey = new EditText(this);
+        etApiKey.setHint("加值中心 HMAC API Key (選填，僅存本機)");
+        etApiKey.setText(TaiwanCommerceGateway.invoiceCfg.apiKey);
+        box.addView(etApiKey);
+
+        ScrollView sv = new ScrollView(this);
+        sv.addView(box);
+
+        new AlertDialog.Builder(this)
+            .setTitle("🧾 台灣電子發票整合設定（各加值中心通用預留）")
+            .setView(sv)
+            .setNegativeButton("取消", null)
+            .setNeutralButton("👁️ 預覽模擬證明聯", new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int w) {
+                    OrderRecord demo = PosPrintEngine.createDemoOrder();
+                    demo.invoiceNo = "TW-00100001";
+                    demo.invoicePeriod = TaiwanCommerceGateway.formatRocPeriod(new Date());
+                    demo.invoiceRandom = "5678";
+                    demo.invoiceStatus = "SANDBOX";
+                    demo.invoiceQrLeft = "TW00100001115111356780000012c0000012c0000000000000000DEMO";
+                    demo.invoiceQrRight = "**白醬起司麵:1:300";
+                    showBitmapPreviewDialog("🧾 台灣電子發票證明聯樣張預覽",
+                        PosPrintEngine.renderEinvoiceProofBitmap(demo, receiptWidthMm));
+                }
+            })
+            .setPositiveButton("💾 儲存發票設定", new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int w) {
+                    String tax = etTaxId.getText().toString().trim();
+                    if (!tax.isEmpty() && !TaiwanCommerceGateway.isValidTaiwanTaxId(tax)) {
+                        Toast.makeText(MainActivity.this, "❌ 賣方統編檢查碼錯誤，未儲存", Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    String tr = etTrack.getText().toString().trim().toUpperCase(Locale.US);
+                    if (!tr.matches("^[A-Z]{2}$")) tr = "TW";
+                    TaiwanCommerceGateway.invoiceCfg.enabled = cbEnabled.isChecked();
+                    TaiwanCommerceGateway.invoiceCfg.printProofWithCarrier = cbPrintWithCarrier.isChecked();
+                    TaiwanCommerceGateway.invoiceCfg.mode = modeChoice[0];
+                    TaiwanCommerceGateway.invoiceCfg.sellerTaxId = tax;
+                    TaiwanCommerceGateway.invoiceCfg.trackPrefix = tr;
+                    TaiwanCommerceGateway.invoiceCfg.relayUrl = etRelay.getText().toString().trim();
+                    TaiwanCommerceGateway.invoiceCfg.merchantId = etMerch.getText().toString().trim();
+                    TaiwanCommerceGateway.invoiceCfg.apiKey = etApiKey.getText().toString().trim();
+                    TaiwanCommerceGateway.saveToDb(dbHelper);
+                    rebuildSettingsTab();
+                    Toast.makeText(MainActivity.this, "✅ 已儲存電子發票設定", Toast.LENGTH_SHORT).show();
+                }
+            })
+            .show();
+    }
+
+    private void showMultiPaymentSettingsDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(10), dp(16), dp(10));
+
+        final String[] lpMode = {TaiwanCommerceGateway.paymentCfg.linePayMode};
+        final Button btnLpMode = new Button(this);
+        btnLpMode.setAllCaps(false);
+        btnLpMode.setText("🟢 LINE Pay 掃碼模式：" + lpMode[0]);
+        btnLpMode.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (TaiwanCommerceGateway.PAY_MODE_OFF.equals(lpMode[0])) lpMode[0] = TaiwanCommerceGateway.PAY_MODE_SANDBOX;
+                else if (TaiwanCommerceGateway.PAY_MODE_SANDBOX.equals(lpMode[0])) lpMode[0] = TaiwanCommerceGateway.PAY_MODE_LIVE;
+                else lpMode[0] = TaiwanCommerceGateway.PAY_MODE_OFF;
+                btnLpMode.setText("🟢 LINE Pay 掃碼模式：" + lpMode[0]);
+            }
+        });
+        box.addView(btnLpMode);
+
+        final EditText etLpChId = new EditText(this);
+        etLpChId.setHint("LINE Pay Channel ID (LIVE 模式必填)");
+        etLpChId.setText(TaiwanCommerceGateway.paymentCfg.linePayChannelId);
+        box.addView(etLpChId);
+
+        final EditText etLpSecret = new EditText(this);
+        etLpSecret.setHint("LINE Pay Channel Secret");
+        etLpSecret.setText(TaiwanCommerceGateway.paymentCfg.linePayChannelSecret);
+        box.addView(etLpSecret);
+
+        final EditText etLpEp = new EditText(this);
+        etLpEp.setHint("LINE Pay Offline API Endpoint");
+        etLpEp.setText(TaiwanCommerceGateway.paymentCfg.linePayEndpoint);
+        box.addView(etLpEp);
+
+        final String[] jkoMode = {TaiwanCommerceGateway.paymentCfg.jkoPayMode};
+        final Button btnJkoMode = new Button(this);
+        btnJkoMode.setAllCaps(false);
+        btnJkoMode.setText("🔴 街口支付掃碼模式：" + jkoMode[0]);
+        btnJkoMode.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (TaiwanCommerceGateway.PAY_MODE_OFF.equals(jkoMode[0])) jkoMode[0] = TaiwanCommerceGateway.PAY_MODE_SANDBOX;
+                else if (TaiwanCommerceGateway.PAY_MODE_SANDBOX.equals(jkoMode[0])) jkoMode[0] = TaiwanCommerceGateway.PAY_MODE_LIVE;
+                else jkoMode[0] = TaiwanCommerceGateway.PAY_MODE_OFF;
+                btnJkoMode.setText("🔴 街口支付掃碼模式：" + jkoMode[0]);
+            }
+        });
+        box.addView(btnJkoMode);
+
+        final EditText etJkoStore = new EditText(this);
+        etJkoStore.setHint("街口商店代號 Store ID");
+        etJkoStore.setText(TaiwanCommerceGateway.paymentCfg.jkoStoreId);
+        box.addView(etJkoStore);
+
+        final EditText etJkoRelay = new EditText(this);
+        etJkoRelay.setHint("街口 POS 中繼 API URL (LIVE 模式必填)");
+        etJkoRelay.setText(TaiwanCommerceGateway.paymentCfg.jkoRelayUrl);
+        box.addView(etJkoRelay);
+
+        final EditText etJkoKey = new EditText(this);
+        etJkoKey.setHint("街口 Merchant Secret Key");
+        etJkoKey.setText(TaiwanCommerceGateway.paymentCfg.jkoMerchantKey);
+        box.addView(etJkoKey);
+
+        final CheckBox cbTwqr = new CheckBox(this);
+        cbTwqr.setText("📱 啟用「TWQR 掃碼」收款視窗 (可顯示店家共通收款 QR Code)");
+        cbTwqr.setChecked(TaiwanCommerceGateway.paymentCfg.twqrEnabled);
+        box.addView(cbTwqr);
+
+        final EditText etTwqrTpl = new EditText(this);
+        etTwqrTpl.setHint("TWQR 字串範本 (支援 {AMOUNT} 與 {ORDER_NO})");
+        etTwqrTpl.setText(TaiwanCommerceGateway.paymentCfg.twqrPayloadTemplate);
+        box.addView(etTwqrTpl);
+
+        ScrollView sv = new ScrollView(this);
+        sv.addView(box);
+
+        new AlertDialog.Builder(this)
+            .setTitle("💳 多元支付設定 (OFF=純記帳 ｜ SANDBOX=本機模擬 ｜ LIVE=正式連線)")
+            .setView(sv)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("💾 儲存多元支付設定", new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int w) {
+                    TaiwanCommerceGateway.paymentCfg.linePayMode = lpMode[0];
+                    TaiwanCommerceGateway.paymentCfg.linePayChannelId = etLpChId.getText().toString().trim();
+                    TaiwanCommerceGateway.paymentCfg.linePayChannelSecret = etLpSecret.getText().toString().trim();
+                    TaiwanCommerceGateway.paymentCfg.linePayEndpoint = etLpEp.getText().toString().trim();
+
+                    TaiwanCommerceGateway.paymentCfg.jkoPayMode = jkoMode[0];
+                    TaiwanCommerceGateway.paymentCfg.jkoStoreId = etJkoStore.getText().toString().trim();
+                    TaiwanCommerceGateway.paymentCfg.jkoRelayUrl = etJkoRelay.getText().toString().trim();
+                    TaiwanCommerceGateway.paymentCfg.jkoMerchantKey = etJkoKey.getText().toString().trim();
+
+                    TaiwanCommerceGateway.paymentCfg.twqrEnabled = cbTwqr.isChecked();
+                    TaiwanCommerceGateway.paymentCfg.twqrPayloadTemplate = etTwqrTpl.getText().toString().trim();
+                    TaiwanCommerceGateway.saveToDb(dbHelper);
+                    rebuildSettingsTab();
+                    Toast.makeText(MainActivity.this, "✅ 已儲存多元支付閘道設定", Toast.LENGTH_SHORT).show();
                 }
             })
             .show();
