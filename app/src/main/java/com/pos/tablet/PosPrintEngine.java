@@ -1,10 +1,27 @@
 package com.pos.tablet;
 
+import android.Manifest;
+import android.app.PendingIntent;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothSocket;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Typeface;
+import android.hardware.usb.UsbConstants;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbDeviceConnection;
+import android.hardware.usb.UsbEndpoint;
+import android.hardware.usb.UsbInterface;
+import android.hardware.usb.UsbManager;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.Layout;
@@ -18,16 +35,57 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
- * Wi-Fi 雙印表機直連引擎 (TCP Port 9100)：
- * 1. HPRT TP805L (支援動態調整字體大小倍率、有效列印點寬、左右防裁切安全邊距 + 全區塊 StaticLayout 自動換行)
- * 2. GoDEX DT2x (40x30mm = 320x240 dots @ 203DPI Canvas 點陣圖封裝 EZPL / TSPL，支援字體大小微調)
+ * 雙印表機多通道直連引擎 (Wi-Fi TCP Port 9100 / 藍牙 SPP / USB OTG)：
+ * 1. HPRT TP805L / 通用 ESC/POS 收據機 (支援動態調整字體大小倍率、有效列印點寬、左右防裁切安全邊距)
+ * 2. GoDEX DT2x / 標籤貼紙機 (40x30mm = 320x240 dots @ 203DPI Canvas 點陣圖封裝 EZPL / TSPL)
  */
 public class PosPrintEngine {
+
+    public static final String CONN_WIFI = "WIFI";
+    public static final String CONN_BT = "BLUETOOTH";
+    public static final String CONN_USB = "USB";
+
+    private static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
+    private static final String ACTION_USB_PERMISSION = "com.pos.tablet.USB_PERMISSION";
+    private static volatile Context appContext;
+    private static final Object BT_LOCK = new Object();
+    private static final Object USB_LOCK = new Object();
+
+    public static void init(Context ctx) {
+        if (ctx != null) appContext = ctx.getApplicationContext();
+    }
+
+    public static class BtDeviceItem {
+        public final String name;
+        public final String mac;
+        public BtDeviceItem(String name, String mac) {
+            this.name = name;
+            this.mac = mac;
+        }
+    }
+
+    public static class UsbDeviceItem {
+        public final String label;
+        public final String vidPid;
+        public final boolean isPrinterClass;
+        public final boolean hasPermission;
+        public UsbDeviceItem(String label, String vidPid, boolean isPrinterClass, boolean hasPermission) {
+            this.label = label;
+            this.vidPid = vidPid;
+            this.isPrinterClass = isPrinterClass;
+            this.hasPermission = hasPermission;
+        }
+    }
 
     public interface PrintCallback {
         void onComplete(boolean allSuccess, String message);
@@ -106,6 +164,25 @@ public class PosPrintEngine {
     public static volatile boolean autoOpenCashDrawerOnCash = false;
     private static final byte[] ESC_POS_KICK_DRAWER = new byte[]{0x1B, 0x70, 0x00, 0x19, (byte) 0xFA};
 
+    // 連線通道設定 (預設皆為 WIFI Port 9100，可切換為 BLUETOOTH / USB)
+    public static volatile String receiptConnMode = CONN_WIFI;
+    public static volatile String receiptBtMac = "";
+    public static volatile String receiptUsbId = "";
+    public static volatile String labelConnMode = CONN_WIFI;
+    public static volatile String labelBtMac = "";
+    public static volatile String labelUsbId = "";
+
+    public static String formatTarget(String mode, String ip, String btMac, String usbId) {
+        if (CONN_BT.equals(mode)) {
+            return (btMac != null && !btMac.trim().isEmpty()) ? ("BT " + btMac.trim()) : "BT (未配對)";
+        }
+        if (CONN_USB.equals(mode)) {
+            return (usbId != null && !usbId.trim().isEmpty() && !"AUTO".equalsIgnoreCase(usbId.trim()))
+                ? ("USB " + usbId.trim()) : "USB OTG(自動)";
+        }
+        return ip != null ? ip.trim() : "";
+    }
+
     private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(2);
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
     private static final int CONNECT_TIMEOUT_MS = 3000;
@@ -121,8 +198,10 @@ public class PosPrintEngine {
             public void run() {
                 final List<String> logs = new ArrayList<>();
                 boolean ok = true;
+                String recTarget = formatTarget(receiptConnMode, receiptIp, receiptBtMac, receiptUsbId);
+                String labTarget = formatTarget(labelConnMode, labelIp, labelBtMac, labelUsbId);
 
-                // A. 列印 HPRT TP805L 收據/廚房總單 (含選擇性錢櫃彈開脈衝)
+                // A. 列印收據/廚房總單 (含選擇性錢櫃彈開脈衝)
                 if (order.printReceipt) {
                     try {
                         Bitmap recBmp = renderReceiptBitmap(order, receiptWidthMm);
@@ -133,20 +212,20 @@ public class PosPrintEngine {
                             combined.write(ESC_POS_KICK_DRAWER);
                             escPosBytes = combined.toByteArray();
                         }
-                        sendTcpWithRetry(receiptIp, receiptPort, escPosBytes);
-                        logs.add("🧾 出單機(" + receiptIp + ")：列印成功" + (order.triggerCashDrawer ? " (已開錢箱)" : ""));
+                        sendBytes(receiptConnMode, receiptIp, receiptPort, receiptBtMac, receiptUsbId, escPosBytes);
+                        logs.add("🧾 出單機(" + recTarget + ")：列印成功" + (order.triggerCashDrawer ? " (已開錢箱)" : ""));
                     } catch (Exception e) {
                         ok = false;
-                        addTechLog("出單機連線失敗(" + receiptIp + ":" + receiptPort + "): " + e.getMessage());
-                        logs.add("⚠️ 出單機(" + receiptIp + ")未連線：" + e.getMessage());
+                        addTechLog("出單機連線失敗(" + recTarget + "): " + e.getMessage());
+                        logs.add("⚠️ 出單機(" + recTarget + ")未連線：" + e.getMessage());
                     }
                 } else if (order.triggerCashDrawer) {
                     try {
-                        sendTcpWithRetry(receiptIp, receiptPort, ESC_POS_KICK_DRAWER);
+                        sendBytes(receiptConnMode, receiptIp, receiptPort, receiptBtMac, receiptUsbId, ESC_POS_KICK_DRAWER);
                         logs.add("💰 已透過出單機彈開錢櫃");
                     } catch (Exception e) {
                         ok = false;
-                        addTechLog("錢櫃開啟失敗(" + receiptIp + ":" + receiptPort + "): " + e.getMessage());
+                        addTechLog("錢櫃開啟失敗(" + recTarget + "): " + e.getMessage());
                         logs.add("⚠️ 錢櫃開啟失敗：" + e.getMessage());
                     }
                 }
@@ -189,12 +268,13 @@ public class PosPrintEngine {
                             }
                         }
                         if (allLabels.size() > 0) {
-                            sendTcpWithRetry(labelIp, labelPort, allLabels.toByteArray());
-                            logs.add("🏷️ 貼紙機(" + labelIp + ")：已印 " + (cur - 1) + " 張");
+                            sendBytes(labelConnMode, labelIp, labelPort, labelBtMac, labelUsbId, allLabels.toByteArray());
+                            logs.add("🏷️ 貼紙機(" + labTarget + ")：已印 " + (cur - 1) + " 張");
                         }
                     } catch (Exception e) {
                         ok = false;
-                        logs.add("⚠️ 貼紙機(" + labelIp + ")未連線：" + e.getMessage());
+                        addTechLog("貼紙機連線失敗(" + labTarget + "): " + e.getMessage());
+                        logs.add("⚠️ 貼紙機(" + labTarget + ")未連線：" + e.getMessage());
                     }
                 }
 
@@ -209,7 +289,7 @@ public class PosPrintEngine {
         });
     }
 
-    // ==================== 2. 每日關帳日結報表列印 (HPRT TP805L) ====================
+    // ==================== 2. 每日關帳日結報表列印 (出單機) ====================
     public static void printClosingReportAsync(final MainActivity.ClosingRecord cr,
                                                final Map<String, Integer> byPay,
                                                final Map<String, Integer> itemRank,
@@ -219,13 +299,14 @@ public class PosPrintEngine {
         EXECUTOR.execute(new Runnable() {
             @Override
             public void run() {
+                String recTarget = formatTarget(receiptConnMode, receiptIp, receiptBtMac, receiptUsbId);
                 try {
                     Bitmap bmp = renderClosingReportBitmap(cr, byPay, itemRank, receiptWidthMm);
                     byte[] payload = encodeEscPosRasterReceipt(bmp, true);
-                    sendTcpWithRetry(receiptIp, receiptPort, payload);
-                    postResult(callback, true, "🧾 HPRT TP805L 日結報表列印成功！");
+                    sendBytes(receiptConnMode, receiptIp, receiptPort, receiptBtMac, receiptUsbId, payload);
+                    postResult(callback, true, "🧾 日結報表列印成功！(" + recTarget + ")");
                 } catch (Exception e) {
-                    postResult(callback, false, "⚠️ 日結單列印失敗 (" + receiptIp + ")：" + e.getMessage());
+                    postResult(callback, false, "⚠️ 日結單列印失敗 (" + recTarget + ")：" + e.getMessage());
                 }
             }
         });
@@ -238,13 +319,14 @@ public class PosPrintEngine {
         EXECUTOR.execute(new Runnable() {
             @Override
             public void run() {
+                String recTarget = formatTarget(receiptConnMode, receiptIp, receiptBtMac, receiptUsbId);
                 try {
                     Bitmap bmp = renderShiftHandoverBitmap(sh, receiptWidthMm);
                     byte[] payload = encodeEscPosRasterReceipt(bmp, true);
-                    sendTcpWithRetry(receiptIp, receiptPort, payload);
-                    postResult(callback, true, "🤝 HPRT TP805L 交班對帳單列印成功！");
+                    sendBytes(receiptConnMode, receiptIp, receiptPort, receiptBtMac, receiptUsbId, payload);
+                    postResult(callback, true, "🤝 交班對帳單列印成功！(" + recTarget + ")");
                 } catch (Exception e) {
-                    postResult(callback, false, "⚠️ 交班單列印失敗 (" + receiptIp + ")：" + e.getMessage());
+                    postResult(callback, false, "⚠️ 交班單列印失敗 (" + recTarget + ")：" + e.getMessage());
                 }
             }
         });
@@ -255,11 +337,12 @@ public class PosPrintEngine {
         EXECUTOR.execute(new Runnable() {
             @Override
             public void run() {
+                String recTarget = formatTarget(receiptConnMode, receiptIp, receiptBtMac, receiptUsbId);
                 try {
-                    sendTcpWithRetry(receiptIp, receiptPort, ESC_POS_KICK_DRAWER);
-                    postResult(callback, true, "💰 錢櫃已彈開！(" + receiptIp + ")");
+                    sendBytes(receiptConnMode, receiptIp, receiptPort, receiptBtMac, receiptUsbId, ESC_POS_KICK_DRAWER);
+                    postResult(callback, true, "💰 錢櫃已彈開！(" + recTarget + ")");
                 } catch (Exception e) {
-                    addTechLog("手動開錢箱失敗(" + receiptIp + ":" + receiptPort + "): " + e.getMessage());
+                    addTechLog("手動開錢箱失敗(" + recTarget + "): " + e.getMessage());
                     postResult(callback, false, "❌ 開錢箱失敗：" + e.getMessage());
                 }
             }
@@ -297,14 +380,15 @@ public class PosPrintEngine {
         EXECUTOR.execute(new Runnable() {
             @Override
             public void run() {
+                String target = formatTarget(receiptConnMode, ip, receiptBtMac, receiptUsbId);
                 try {
                     MainActivity.OrderRecord demo = createDemoOrder();
                     Bitmap bmp = renderReceiptBitmap(demo, widthMm);
                     byte[] payload = encodeEscPosRasterReceipt(bmp, true);
-                    sendTcpWithRetry(ip, port, payload);
-                    postResult(callback, true, "✅ HPRT TP805L (" + ip + ":" + port + ") 測試收據列印成功！");
+                    sendBytes(receiptConnMode, ip, port, receiptBtMac, receiptUsbId, payload);
+                    postResult(callback, true, "✅ 出單機 (" + target + ") 測試收據列印成功！");
                 } catch (Exception e) {
-                    postResult(callback, false, "❌ HPRT TP805L (" + ip + ":" + port + ") 連線失敗：" + e.getMessage());
+                    postResult(callback, false, "❌ 出單機 (" + target + ") 連線失敗：" + e.getMessage());
                 }
             }
         });
@@ -315,6 +399,7 @@ public class PosPrintEngine {
         EXECUTOR.execute(new Runnable() {
             @Override
             public void run() {
+                String target = formatTarget(labelConnMode, ip, labelBtMac, labelUsbId);
                 try {
                     Bitmap bmp = renderLabelBitmap40x30(
                         "#001", "外帶", 1, 1,
@@ -322,10 +407,10 @@ public class PosPrintEngine {
                     byte[] payload = "TSPL".equalsIgnoreCase(protocol)
                         ? encodeTsplLabel40x30(bmp)
                         : encodeEzplLabel40x30(bmp);
-                    sendTcpWithRetry(ip, port, payload);
-                    postResult(callback, true, "✅ GoDEX DT2x (" + ip + ":" + port + ") 測試貼紙列印成功！");
+                    sendBytes(labelConnMode, ip, port, labelBtMac, labelUsbId, payload);
+                    postResult(callback, true, "✅ 貼紙機 (" + target + ") 測試貼紙列印成功！");
                 } catch (Exception e) {
-                    postResult(callback, false, "❌ GoDEX DT2x (" + ip + ":" + port + ") 連線失敗：" + e.getMessage());
+                    postResult(callback, false, "❌ 貼紙機 (" + target + ") 連線失敗：" + e.getMessage());
                 }
             }
         });
@@ -337,14 +422,15 @@ public class PosPrintEngine {
         EXECUTOR.execute(new Runnable() {
             @Override
             public void run() {
+                String target = formatTarget(receiptConnMode, receiptIp, receiptBtMac, receiptUsbId);
                 try {
                     Bitmap bmp = QrCodeGenerator.renderTableQrStandeeBitmap(
                         tableName, orderUrl, receiptPrintableDots);
                     byte[] payload = encodeEscPosRasterReceipt(bmp, true);
-                    sendTcpWithRetry(receiptIp, receiptPort, payload);
-                    postResult(callback, true, "✅ 已從 HPRT TP805L 印出【" + tableName + "】掃碼點餐立牌！");
+                    sendBytes(receiptConnMode, receiptIp, receiptPort, receiptBtMac, receiptUsbId, payload);
+                    postResult(callback, true, "✅ 已從出單機 (" + target + ") 印出【" + tableName + "】掃碼點餐立牌！");
                 } catch (Exception e) {
-                    postResult(callback, false, "❌ 列印桌牌失敗 (" + receiptIp + ")：" + e.getMessage());
+                    postResult(callback, false, "❌ 列印桌牌失敗 (" + target + ")：" + e.getMessage());
                 }
             }
         });
@@ -358,7 +444,19 @@ public class PosPrintEngine {
         });
     }
 
-    // ==================== TCP Socket 傳送 (含逾時保護與自動重試) ====================
+    // ==================== 多通道統一傳送入口 (Wi-Fi TCP / Bluetooth SPP / USB OTG) ====================
+    private static void sendBytes(String mode, String ip, int port, String btMac, String usbId, byte[] data) throws Exception {
+        if (data == null || data.length == 0) return;
+        if (CONN_BT.equals(mode)) {
+            sendBluetoothSpp(btMac, data);
+        } else if (CONN_USB.equals(mode)) {
+            sendUsbOtg(usbId, data);
+        } else {
+            sendTcpWithRetry(ip, port, data);
+        }
+    }
+
+    // ==================== 1. Wi-Fi TCP Socket 傳送 (含逾時保護與自動重試) ====================
     private static void sendTcpWithRetry(String ip, int port, byte[] data) throws Exception {
         if (ip == null || ip.trim().isEmpty()) {
             throw new IllegalArgumentException("未設定印表機 IP");
@@ -380,6 +478,248 @@ public class PosPrintEngine {
             }
         }
         throw lastErr != null ? lastErr : new RuntimeException("TCP 傳送失敗");
+    }
+
+    // ==================== 2. 藍牙 SPP RFCOMM 傳送 ====================
+    private static void sendBluetoothSpp(String mac, byte[] data) throws Exception {
+        if (mac == null || mac.trim().isEmpty()) {
+            throw new IllegalArgumentException("尚未指定藍牙印表機 MAC 位址，請先於設定頁配對選取");
+        }
+        BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+        if (adapter == null) throw new IllegalStateException("此平板不支援藍牙");
+        if (!adapter.isEnabled()) throw new IllegalStateException("藍牙未開啟，請先於平板系統開啟藍牙");
+        if (Build.VERSION.SDK_INT >= 31 && (appContext == null
+            || appContext.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED)) {
+            throw new SecurityException("缺少藍牙「鄰近裝置」連線權限，請於設定頁點擊選取藍牙以授權");
+        }
+
+        synchronized (BT_LOCK) {
+            try { adapter.cancelDiscovery(); } catch (Exception ignored) {}
+            BluetoothDevice device = adapter.getRemoteDevice(mac.trim().toUpperCase(Locale.US));
+            BluetoothSocket socket = null;
+            try {
+                try {
+                    socket = device.createRfcommSocketToServiceRecord(SPP_UUID);
+                    socket.connect();
+                } catch (Exception primaryErr) {
+                    if (socket != null) try { socket.close(); } catch (Exception ignored) {}
+                    socket = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID);
+                    socket.connect();
+                }
+                OutputStream os = socket.getOutputStream();
+                int offset = 0;
+                final int chunk = 1024;
+                while (offset < data.length) {
+                    int len = Math.min(chunk, data.length - offset);
+                    os.write(data, offset, len);
+                    os.flush();
+                    offset += len;
+                }
+                // 預留短暫緩衝讓印表機收齊尾端指令後再關閉 RFCOMM
+                try { Thread.sleep(150); } catch (InterruptedException ignored) {}
+            } finally {
+                if (socket != null) try { socket.close(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    // ==================== 3. USB OTG Host Bulk-Out 傳送 ====================
+    private static class UsbPrinterEndpoint {
+        final UsbInterface intf;
+        final UsbEndpoint epOut;
+        UsbPrinterEndpoint(UsbInterface intf, UsbEndpoint epOut) {
+            this.intf = intf;
+            this.epOut = epOut;
+        }
+    }
+
+    private static String formatUsbVidPid(UsbDevice d) {
+        return String.format(Locale.US, "%04X:%04X", d.getVendorId(), d.getProductId());
+    }
+
+    private static UsbPrinterEndpoint findPrinterBulkOutEndpoint(UsbDevice dev) {
+        if (dev == null) return null;
+        UsbPrinterEndpoint fallback = null;
+        for (int i = 0; i < dev.getInterfaceCount(); i++) {
+            UsbInterface intf = dev.getInterface(i);
+            int cls = intf.getInterfaceClass();
+            UsbEndpoint out = null;
+            for (int e = 0; e < intf.getEndpointCount(); e++) {
+                UsbEndpoint ep = intf.getEndpoint(e);
+                if (ep.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK
+                    && ep.getDirection() == UsbConstants.USB_DIR_OUT) {
+                    out = ep;
+                    break;
+                }
+            }
+            if (out == null) continue;
+            if (cls == UsbConstants.USB_CLASS_PRINTER) {
+                return new UsbPrinterEndpoint(intf, out);
+            }
+            // 跳過讀卡機/隨身碟/鍵盤滑鼠/集線器類別，保留轉接晶片 (如 CDC/Vendor) 作為備選
+            if (fallback == null
+                && cls != UsbConstants.USB_CLASS_MASS_STORAGE
+                && cls != UsbConstants.USB_CLASS_HID
+                && cls != UsbConstants.USB_CLASS_HUB
+                && cls != UsbConstants.USB_CLASS_AUDIO) {
+                fallback = new UsbPrinterEndpoint(intf, out);
+            }
+        }
+        return fallback;
+    }
+
+    private static UsbDevice findTargetUsbDevice(UsbManager um, String usbId) {
+        if (um == null) return null;
+        String want = usbId != null ? usbId.trim().toUpperCase(Locale.US) : "";
+        boolean autoMode = want.isEmpty() || "AUTO".equals(want);
+        UsbDevice autoCandidate = null;
+        for (UsbDevice dev : um.getDeviceList().values()) {
+            UsbPrinterEndpoint ep = findPrinterBulkOutEndpoint(dev);
+            if (ep == null) continue;
+            if (!autoMode) {
+                if (want.equals(formatUsbVidPid(dev))) return dev;
+            } else {
+                if (ep.intf.getInterfaceClass() == UsbConstants.USB_CLASS_PRINTER) return dev;
+                if (autoCandidate == null) autoCandidate = dev;
+            }
+        }
+        return autoCandidate;
+    }
+
+    private static void ensureUsbPermission(UsbManager um, UsbDevice dev) throws Exception {
+        if (um.hasPermission(dev)) return;
+        if (appContext == null) throw new IllegalStateException("POS 列印引擎尚未初始化 Context");
+
+        final CountDownLatch latch = new CountDownLatch(1);
+        final boolean[] grantedHolder = new boolean[]{false};
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context context, Intent intent) {
+                if (!ACTION_USB_PERMISSION.equals(intent.getAction())) return;
+                UsbDevice extraDev = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                if (extraDev == null || extraDev.getDeviceId() == dev.getDeviceId()) {
+                    grantedHolder[0] = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
+                    latch.countDown();
+                }
+            }
+        };
+
+        IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
+        if (Build.VERSION.SDK_INT >= 33) {
+            appContext.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            appContext.registerReceiver(receiver, filter);
+        }
+        try {
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+            if (Build.VERSION.SDK_INT >= 31) flags |= PendingIntent.FLAG_MUTABLE;
+            Intent permIntent = new Intent(ACTION_USB_PERMISSION).setPackage(appContext.getPackageName());
+            PendingIntent pi = PendingIntent.getBroadcast(appContext, dev.getDeviceId(), permIntent, flags);
+            um.requestPermission(dev, pi);
+            boolean completed = latch.await(15, TimeUnit.SECONDS);
+            if (!completed || (!grantedHolder[0] && !um.hasPermission(dev))) {
+                throw new SecurityException("未取得 USB OTG 裝置存取權限，請插拔轉接線後點擊「允許」");
+            }
+        } finally {
+            try { appContext.unregisterReceiver(receiver); } catch (Exception ignored) {}
+        }
+    }
+
+    private static void sendUsbOtg(String usbId, byte[] data) throws Exception {
+        if (appContext == null) throw new IllegalStateException("POS 列印引擎尚未初始化 Context");
+        UsbManager um = (UsbManager) appContext.getSystemService(Context.USB_SERVICE);
+        if (um == null) throw new IllegalStateException("此平板不支援 USB OTG Host");
+
+        synchronized (USB_LOCK) {
+            UsbDevice dev = findTargetUsbDevice(um, usbId);
+            if (dev == null) {
+                throw new IllegalStateException("未偵測到 USB 出單機/貼紙機，請確認 OTG 轉接線與電源已插妥");
+            }
+            UsbPrinterEndpoint ep = findPrinterBulkOutEndpoint(dev);
+            if (ep == null) {
+                throw new IllegalStateException("USB 裝置 (" + formatUsbVidPid(dev) + ") 無可用列印端點");
+            }
+            ensureUsbPermission(um, dev);
+
+            UsbDeviceConnection conn = um.openDevice(dev);
+            if (conn == null) throw new IllegalStateException("無法開啟 USB 裝置連線 (" + formatUsbVidPid(dev) + ")");
+            boolean claimed = false;
+            try {
+                claimed = conn.claimInterface(ep.intf, true);
+                if (!claimed) throw new IllegalStateException("無法佔用 USB 列印介面");
+                int offset = 0;
+                final int chunkMax = 16384;
+                while (offset < data.length) {
+                    int len = Math.min(chunkMax, data.length - offset);
+                    byte[] slice = new byte[len];
+                    System.arraycopy(data, offset, slice, 0, len);
+                    int written = conn.bulkTransfer(ep.epOut, slice, len, SO_TIMEOUT_MS);
+                    if (written < 0) {
+                        throw new RuntimeException("USB bulkTransfer 寫入失敗 (code=" + written + ")");
+                    }
+                    offset += written > 0 ? written : len;
+                }
+            } finally {
+                if (claimed) try { conn.releaseInterface(ep.intf); } catch (Exception ignored) {}
+                try { conn.close(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    public static List<BtDeviceItem> listBondedBluetoothDevices(Context ctx) throws Exception {
+        BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+        if (adapter == null) throw new IllegalStateException("此平板不支援藍牙");
+        if (!adapter.isEnabled()) throw new IllegalStateException("平板藍牙尚未開啟");
+        if (Build.VERSION.SDK_INT >= 31 && ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            throw new SecurityException("NEED_BLUETOOTH_CONNECT");
+        }
+        List<BtDeviceItem> list = new ArrayList<>();
+        Set<BluetoothDevice> bonded = adapter.getBondedDevices();
+        if (bonded != null) {
+            for (BluetoothDevice d : bonded) {
+                String name = d.getName();
+                if (name == null || name.trim().isEmpty()) name = "藍牙裝置";
+                list.add(new BtDeviceItem(name, d.getAddress()));
+            }
+        }
+        return list;
+    }
+
+    public static List<UsbDeviceItem> listUsbPrinterCandidates(Context ctx) {
+        List<UsbDeviceItem> list = new ArrayList<>();
+        UsbManager um = ctx != null ? (UsbManager) ctx.getSystemService(Context.USB_SERVICE) : null;
+        if (um == null) return list;
+        for (UsbDevice dev : um.getDeviceList().values()) {
+            UsbPrinterEndpoint ep = findPrinterBulkOutEndpoint(dev);
+            if (ep == null) continue;
+            String prod = Build.VERSION.SDK_INT >= 21 ? dev.getProductName() : null;
+            if (prod == null || prod.trim().isEmpty()) prod = "USB 列印/串列裝置";
+            boolean isPrn = ep.intf.getInterfaceClass() == UsbConstants.USB_CLASS_PRINTER;
+            String vidPid = formatUsbVidPid(dev);
+            String label = (isPrn ? "🖨️ " : "🔌 ") + prod + " [" + vidPid + "]"
+                + (um.hasPermission(dev) ? " (已授權)" : " (點擊授權)");
+            list.add(new UsbDeviceItem(label, vidPid, isPrn, um.hasPermission(dev)));
+        }
+        return list;
+    }
+
+    public static void requestUsbPermissionAsync(final Context ctx, final String vidPid, final PrintCallback cb) {
+        init(ctx);
+        EXECUTOR.execute(new Runnable() {
+            @Override public void run() {
+                try {
+                    UsbManager um = (UsbManager) appContext.getSystemService(Context.USB_SERVICE);
+                    UsbDevice dev = findTargetUsbDevice(um, vidPid);
+                    if (dev == null) {
+                        postResult(cb, false, "未找到對應的 USB OTG 裝置");
+                        return;
+                    }
+                    ensureUsbPermission(um, dev);
+                    postResult(cb, true, "✅ 已取得 USB OTG 裝置 (" + formatUsbVidPid(dev) + ") 授權！");
+                } catch (Exception e) {
+                    postResult(cb, false, "⚠️ " + e.getMessage());
+                }
+            }
+        });
     }
 
     // ==================== HPRT TP805L 收據渲染 (全 StaticLayout 自動換行 + 防邊緣裁切) ====================
@@ -795,14 +1135,14 @@ public class PosPrintEngine {
         return sb.toString();
     }
 
-    // ==================== 區網印表機狀態偵測 & 自動搜尋 IP (Port 9100) ====================
+    // ==================== 印表機連線狀態偵測 (Wi-Fi / 藍牙 / USB OTG) ====================
     public static void probePrintersStatusAsync(final String receiptIp, final int receiptPort,
                                                 final String labelIp, final int labelPort,
                                                 final StatusCallback cb) {
         EXECUTOR.execute(new Runnable() {
             @Override public void run() {
-                final boolean rOk = isPortOpen(receiptIp, receiptPort, 750);
-                final boolean lOk = isPortOpen(labelIp, labelPort, 750);
+                final boolean rOk = probeSinglePrinter(receiptConnMode, receiptIp, receiptPort, receiptBtMac, receiptUsbId);
+                final boolean lOk = probeSinglePrinter(labelConnMode, labelIp, labelPort, labelBtMac, labelUsbId);
                 MAIN_HANDLER.post(new Runnable() {
                     @Override public void run() {
                         if (cb != null) cb.onStatus(rOk, lOk);
@@ -810,6 +1150,33 @@ public class PosPrintEngine {
                 });
             }
         });
+    }
+
+    private static boolean probeSinglePrinter(String mode, String ip, int port, String btMac, String usbId) {
+        if (CONN_BT.equals(mode)) {
+            if (btMac == null || btMac.trim().isEmpty()) return false;
+            BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+            if (adapter == null || !adapter.isEnabled()) return false;
+            if (Build.VERSION.SDK_INT >= 31 && (appContext == null
+                || appContext.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED)) {
+                return false;
+            }
+            try {
+                Set<BluetoothDevice> bonded = adapter.getBondedDevices();
+                if (bonded == null) return false;
+                String target = btMac.trim().toUpperCase(Locale.US);
+                for (BluetoothDevice d : bonded) {
+                    if (target.equals(d.getAddress())) return true;
+                }
+            } catch (Exception ignored) {}
+            return false;
+        }
+        if (CONN_USB.equals(mode)) {
+            if (appContext == null) return false;
+            UsbManager um = (UsbManager) appContext.getSystemService(Context.USB_SERVICE);
+            return findTargetUsbDevice(um, usbId) != null;
+        }
+        return isPortOpen(ip, port, 750);
     }
 
     private static boolean isPortOpen(String ip, int port, int timeoutMs) {

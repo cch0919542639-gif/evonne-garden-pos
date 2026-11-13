@@ -1,7 +1,7 @@
 {
-  "versionCode": 5,
-  "versionName": "1.4",
+  "versionCode": 6,
+  "versionName": "1.5",
   "apkUrl": "https://github.com/cch0919542639-gif/evonne-garden-pos/releases/latest/download/pos_tablet_app.apk",
   "rollbackUrl": "",
-  "releaseNotes": "v1.4 (Build 5) 商業授權與錢櫃整合版：\n1. 新增 RSA-2048 離線商業授權驗證模組（支援買斷 / 年費 / 月租 + 14 天試用 + 功能分級解鎖，創始門市自動豁免）\n2. 新增出單機 RJ-11 錢櫃連動彈開指令 (ESC p)，支援現金結帳自動開錢箱與手動測試開錢箱"
+  "releaseNotes": "v1.5 (Build 6) 多通道硬體相容強化版：\n1. 新增 USB OTG Host 出單機 / 貼紙機支援（含執行期權限授權、印表機類別優先偵測與 VID:PID 綁定）\n2. 新增藍牙 SPP 出單機 / 貼紙機支援（相容 Android 12+ 鄰近裝置權限與分段緩衝寫入）\n3. 設定頁支援雙機獨立切換 Wi-Fi / 藍牙 / USB OTG 通道並即時顯示連線狀態徽章"
 }

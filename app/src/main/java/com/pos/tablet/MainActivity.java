@@ -1,11 +1,14 @@
 package com.pos.tablet;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.DialogInterface;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
 import android.util.TypedValue;
@@ -302,6 +305,8 @@ public class MainActivity extends Activity {
     private long lastHandoverOrderDbId = 0L;
     private final List<StaffMember> staffMembers = new ArrayList<>();
     private LicenseManager.LicenseState licenseState = null;
+    private static final int REQ_BLUETOOTH_CONNECT = 9101;
+    private boolean pendingBtPickerForReceipt = true;
 
     private final List<MenuItem> menuItems = new ArrayList<>();
     private final List<DrinkUpgradeOption> mealDrinkPool = new ArrayList<>();
@@ -386,6 +391,7 @@ public class MainActivity extends Activity {
         }
 
         dbHelper = new PosDatabaseHelper(this);
+        PosPrintEngine.init(this);
         boolean isFirstFreshInstall = loadDatabaseState();
         buildRootUI();
         updateBrandAndStaffHeader();
@@ -584,6 +590,12 @@ public class MainActivity extends Activity {
         labelProtocol = dbHelper.getSetting("label_protocol", "EZPL");
         PosPrintEngine.labelFontScalePercent = dbHelper.getIntSetting("label_font_scale", 115);
         PosPrintEngine.labelMarginDots = dbHelper.getIntSetting("label_margin_dots", 12);
+        PosPrintEngine.receiptConnMode = dbHelper.getSetting("receipt_conn_mode", PosPrintEngine.CONN_WIFI);
+        PosPrintEngine.receiptBtMac = dbHelper.getSetting("receipt_bt_mac", "");
+        PosPrintEngine.receiptUsbId = dbHelper.getSetting("receipt_usb_id", "");
+        PosPrintEngine.labelConnMode = dbHelper.getSetting("label_conn_mode", PosPrintEngine.CONN_WIFI);
+        PosPrintEngine.labelBtMac = dbHelper.getSetting("label_bt_mac", "");
+        PosPrintEngine.labelUsbId = dbHelper.getSetting("label_usb_id", "");
         PosPrintEngine.autoOpenCashDrawerOnCash = "1".equals(dbHelper.getSetting("auto_open_cash_drawer", "0"));
         googleSheetUrl = dbHelper.getSetting("google_sheet_url", "");
         otaManifestUrl = dbHelper.getSetting("ota_manifest_url", DEFAULT_OTA_MANIFEST_URL);
@@ -3998,8 +4010,8 @@ public class MainActivity extends Activity {
         brandPanel.addView(licRow);
         box.addView(brandPanel);
 
-        // 1. 出單機 HPRT TP805L 設定、字體大小調整與防邊緣裁切設定
-        addSectionHeader(box, "🧾 1. 出單機設定 (HPRT TP805L - 字體大小、紙寬與防邊緣裁切設定)");
+        // 1. 出單機設定 (支援 Wi-Fi / 藍牙 BT / USB OTG + 字體大小與防裁切邊距)
+        addSectionHeader(box, "🧾 1. 出單機設定 (Wi-Fi Port 9100 / 藍牙 BT / USB OTG)");
         LinearLayout recRow = new LinearLayout(this);
         recRow.setOrientation(LinearLayout.HORIZONTAL);
         recRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -4009,6 +4021,7 @@ public class MainActivity extends Activity {
         etRecIp.setText(receiptIp);
         etRecIp.setTextColor(Color.WHITE);
         etRecIp.setTextSize(13);
+        etRecIp.setVisibility(PosPrintEngine.CONN_WIFI.equals(PosPrintEngine.receiptConnMode) ? View.VISIBLE : View.GONE);
         recRow.addView(etRecIp, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         Button btnPreviewRecBmp = new Button(this);
@@ -4034,10 +4047,13 @@ public class MainActivity extends Activity {
             @Override public void onClick(View v) {
                 receiptIp = etRecIp.getText().toString().trim();
                 dbHelper.setSetting("receipt_ip", receiptIp);
-                Toast.makeText(MainActivity.this, "連線測試 HPRT TP805L (" + receiptIp + ":9100)...", Toast.LENGTH_SHORT).show();
+                String target = PosPrintEngine.formatTarget(
+                    PosPrintEngine.receiptConnMode, receiptIp, PosPrintEngine.receiptBtMac, PosPrintEngine.receiptUsbId);
+                Toast.makeText(MainActivity.this, "連線測試出單機 (" + target + ")...", Toast.LENGTH_SHORT).show();
                 PosPrintEngine.printTestReceiptAsync(receiptIp, receiptPort, receiptWidthMm,
                     new PosPrintEngine.PrintCallback() {
                         @Override public void onComplete(boolean ok, String msg) {
+                            refreshPrinterStatusBadge();
                             Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show();
                         }
                     });
@@ -4047,6 +4063,7 @@ public class MainActivity extends Activity {
             ViewGroup.LayoutParams.WRAP_CONTENT, dp(36));
         lpTestRec.leftMargin = dp(6);
         recRow.addView(btnTestRec, lpTestRec);
+        box.addView(buildPrinterTransportPanel(true, etRecIp));
         box.addView(recRow);
 
         // 出單機【字體大小】與【防裁切邊距/有效點寬】微調面板
@@ -4233,8 +4250,8 @@ public class MainActivity extends Activity {
 
         box.addView(recTunePanel);
 
-        // 2. 貼紙機 GoDEX DT2x 設定與連線測試
-        addSectionHeader(box, "🏷️ 2. 貼紙機設定 (GoDEX DT2x - 40×30mm 點陣防亂碼 Wi-Fi Port 9100)");
+        // 2. 貼紙機設定與連線測試 (Wi-Fi / 藍牙 BT / USB OTG)
+        addSectionHeader(box, "🏷️ 2. 貼紙機設定 (40×30mm 點陣防亂碼：Wi-Fi Port 9100 / 藍牙 BT / USB OTG)");
         LinearLayout labRow = new LinearLayout(this);
         labRow.setOrientation(LinearLayout.HORIZONTAL);
         labRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -4244,6 +4261,7 @@ public class MainActivity extends Activity {
         etLabIp.setText(labelIp);
         etLabIp.setTextColor(Color.WHITE);
         etLabIp.setTextSize(13);
+        etLabIp.setVisibility(PosPrintEngine.CONN_WIFI.equals(PosPrintEngine.labelConnMode) ? View.VISIBLE : View.GONE);
         labRow.addView(etLabIp, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         final Button btnToggleProto = new Button(this);
@@ -4295,16 +4313,20 @@ public class MainActivity extends Activity {
             @Override public void onClick(View v) {
                 labelIp = etLabIp.getText().toString().trim();
                 dbHelper.setSetting("label_ip", labelIp);
-                Toast.makeText(MainActivity.this, "連線測試 GoDEX DT2x (" + labelIp + ":9100)...", Toast.LENGTH_SHORT).show();
+                String target = PosPrintEngine.formatTarget(
+                    PosPrintEngine.labelConnMode, labelIp, PosPrintEngine.labelBtMac, PosPrintEngine.labelUsbId);
+                Toast.makeText(MainActivity.this, "連線測試貼紙機 (" + target + ")...", Toast.LENGTH_SHORT).show();
                 PosPrintEngine.printTestLabelAsync(labelIp, labelPort, labelProtocol,
                     new PosPrintEngine.PrintCallback() {
                         @Override public void onComplete(boolean ok, String msg) {
+                            refreshPrinterStatusBadge();
                             Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show();
                         }
                     });
             }
         });
         labRow.addView(btnTestLab);
+        box.addView(buildPrinterTransportPanel(false, etLabIp));
         box.addView(labRow);
 
         Button btnDiscoverPrinters = new Button(this);
@@ -4336,7 +4358,7 @@ public class MainActivity extends Activity {
         cloudBtnRow.setOrientation(LinearLayout.HORIZONTAL);
 
         Button btnSaveCfg = new Button(this);
-        btnSaveCfg.setText("💾 儲存雙機 IP 與雲端網址");
+        btnSaveCfg.setText("💾 儲存印表機通道與雲端網址");
         btnSaveCfg.setAllCaps(false);
         btnSaveCfg.setTextSize(12);
         btnSaveCfg.setTextColor(Color.parseColor("#052E16"));
@@ -4350,6 +4372,7 @@ public class MainActivity extends Activity {
                 dbHelper.setSetting("receipt_ip", receiptIp);
                 dbHelper.setSetting("label_ip", labelIp);
                 dbHelper.setSetting("google_sheet_url", googleSheetUrl);
+                refreshPrinterStatusBadge();
                 Toast.makeText(MainActivity.this, "✅ 已永久保存於平板 SQLite 資料庫！", Toast.LENGTH_SHORT).show();
             }
         });
@@ -5104,19 +5127,220 @@ public class MainActivity extends Activity {
         }
     }
 
+    private static String badgeConnSuffix(String mode) {
+        if (PosPrintEngine.CONN_BT.equals(mode)) return "(BT)";
+        if (PosPrintEngine.CONN_USB.equals(mode)) return "(USB)";
+        return "";
+    }
+
     private void refreshPrinterStatusBadge() {
         if (tvPrinterStatusBadge == null) return;
         PosPrintEngine.probePrintersStatusAsync(receiptIp, receiptPort, labelIp, labelPort,
             new PosPrintEngine.StatusCallback() {
                 @Override public void onStatus(boolean receiptOnline, boolean labelOnline) {
                     tvPrinterStatusBadge.setText(
-                        (receiptOnline ? "🟢收據" : "🔴收據") + " " + (labelOnline ? "🟢貼紙" : "🔴貼紙"));
+                        (receiptOnline ? "🟢收據" : "🔴收據") + badgeConnSuffix(PosPrintEngine.receiptConnMode)
+                        + " "
+                        + (labelOnline ? "🟢貼紙" : "🔴貼紙") + badgeConnSuffix(PosPrintEngine.labelConnMode));
                     tvPrinterStatusBadge.setBackground(roundBg(
                         (receiptOnline && labelOnline) ? Color.parseColor("#064E3B") : Color.parseColor("#450A0A"),
                         (receiptOnline && labelOnline) ? Color.parseColor("#10B981") : Color.parseColor("#EF4444"),
                         1, 6));
                 }
             });
+    }
+
+    private LinearLayout buildPrinterTransportPanel(final boolean isReceipt, final EditText etIp) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(2), 0, dp(4));
+
+        final String curMode = isReceipt ? PosPrintEngine.receiptConnMode : PosPrintEngine.labelConnMode;
+        final String[] modes = {PosPrintEngine.CONN_WIFI, PosPrintEngine.CONN_BT, PosPrintEngine.CONN_USB};
+        final String[] labels = {"📶 Wi-Fi", "📘 藍牙 BT", "🔌 USB OTG"};
+
+        for (int i = 0; i < modes.length; i++) {
+            final String m = modes[i];
+            Button btnMode = new Button(this);
+            btnMode.setText(labels[i]);
+            btnMode.setAllCaps(false);
+            btnMode.setTextSize(11);
+            btnMode.setPadding(dp(8), dp(2), dp(8), dp(2));
+            boolean active = m.equals(curMode);
+            btnMode.setTextColor(active ? Color.parseColor("#052E16") : Color.WHITE);
+            btnMode.setTypeface(null, active ? Typeface.BOLD : Typeface.NORMAL);
+            btnMode.setBackground(roundBg(
+                active ? Color.parseColor("#38BDF8") : Color.parseColor("#334155"), 0, 0, 6));
+            btnMode.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    if (isReceipt) {
+                        PosPrintEngine.receiptConnMode = m;
+                        dbHelper.setSetting("receipt_conn_mode", m);
+                    } else {
+                        PosPrintEngine.labelConnMode = m;
+                        dbHelper.setSetting("label_conn_mode", m);
+                    }
+                    if (etIp != null) {
+                        etIp.setVisibility(PosPrintEngine.CONN_WIFI.equals(m) ? View.VISIBLE : View.GONE);
+                    }
+                    refreshPrinterStatusBadge();
+                    rebuildSettingsTab();
+                }
+            });
+            LinearLayout.LayoutParams lpM = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32));
+            lpM.rightMargin = dp(4);
+            row.addView(btnMode, lpM);
+        }
+
+        if (PosPrintEngine.CONN_BT.equals(curMode)) {
+            String curMac = isReceipt ? PosPrintEngine.receiptBtMac : PosPrintEngine.labelBtMac;
+            Button btnPickBt = new Button(this);
+            btnPickBt.setText("📘 選擇已配對藍牙：" + (curMac.isEmpty() ? "(尚未選取)" : curMac));
+            btnPickBt.setAllCaps(false);
+            btnPickBt.setTextSize(11);
+            btnPickBt.setTextColor(Color.WHITE);
+            btnPickBt.setBackground(roundBg(Color.parseColor("#1D4ED8"), 0, 0, 6));
+            btnPickBt.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) { showBluetoothPrinterPickerDialog(isReceipt); }
+            });
+            row.addView(btnPickBt, new LinearLayout.LayoutParams(0, dp(32), 1f));
+        } else if (PosPrintEngine.CONN_USB.equals(curMode)) {
+            String curUsb = isReceipt ? PosPrintEngine.receiptUsbId : PosPrintEngine.labelUsbId;
+            String usbText = (curUsb == null || curUsb.isEmpty() || "AUTO".equalsIgnoreCase(curUsb))
+                ? "自動偵測印表機" : curUsb;
+            Button btnPickUsb = new Button(this);
+            btnPickUsb.setText("🔌 選擇 / 授權 USB OTG：" + usbText);
+            btnPickUsb.setAllCaps(false);
+            btnPickUsb.setTextSize(11);
+            btnPickUsb.setTextColor(Color.WHITE);
+            btnPickUsb.setBackground(roundBg(Color.parseColor("#0F766E"), 0, 0, 6));
+            btnPickUsb.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) { showUsbPrinterPickerDialog(isReceipt); }
+            });
+            row.addView(btnPickUsb, new LinearLayout.LayoutParams(0, dp(32), 1f));
+        } else {
+            TextView tvHint = new TextView(this);
+            tvHint.setText("走 TCP Port 9100（下方輸入 IP 或按區網搜尋）");
+            tvHint.setTextColor(Color.parseColor("#94A3B8"));
+            tvHint.setTextSize(11);
+            tvHint.setPadding(dp(4), 0, 0, 0);
+            row.addView(tvHint, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        }
+        return row;
+    }
+
+    private void showBluetoothPrinterPickerDialog(final boolean isReceipt) {
+        if (Build.VERSION.SDK_INT >= 31
+            && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            pendingBtPickerForReceipt = isReceipt;
+            requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT}, REQ_BLUETOOTH_CONNECT);
+            return;
+        }
+        try {
+            final List<PosPrintEngine.BtDeviceItem> list = PosPrintEngine.listBondedBluetoothDevices(this);
+            if (list.isEmpty()) {
+                new AlertDialog.Builder(this)
+                    .setTitle("📘 找不到已配對藍牙裝置")
+                    .setMessage("請先打開印表機電源，並到平板「系統設定 ➔ 藍牙」完成配對（常見 PIN 為 0000 或 1234）後，再回來選取！")
+                    .setPositiveButton("我知道了", null)
+                    .show();
+                return;
+            }
+            String[] items = new String[list.size()];
+            for (int i = 0; i < list.size(); i++) {
+                PosPrintEngine.BtDeviceItem b = list.get(i);
+                items[i] = "🖨️ " + b.name + "  [" + b.mac + "]";
+            }
+            new AlertDialog.Builder(this)
+                .setTitle("📘 選取" + (isReceipt ? "收據出單機" : "標籤貼紙機") + "藍牙裝置")
+                .setItems(items, new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface d, int which) {
+                        PosPrintEngine.BtDeviceItem chosen = list.get(which);
+                        if (isReceipt) {
+                            PosPrintEngine.receiptBtMac = chosen.mac;
+                            dbHelper.setSetting("receipt_bt_mac", chosen.mac);
+                        } else {
+                            PosPrintEngine.labelBtMac = chosen.mac;
+                            dbHelper.setSetting("label_bt_mac", chosen.mac);
+                        }
+                        refreshPrinterStatusBadge();
+                        rebuildSettingsTab();
+                        Toast.makeText(MainActivity.this,
+                            "✅ 已綁定藍牙：" + chosen.name + " (" + chosen.mac + ")", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+        } catch (Exception e) {
+            Toast.makeText(this, "⚠️ " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void showUsbPrinterPickerDialog(final boolean isReceipt) {
+        final List<PosPrintEngine.UsbDeviceItem> list = PosPrintEngine.listUsbPrinterCandidates(this);
+        if (list.isEmpty()) {
+            new AlertDialog.Builder(this)
+                .setTitle("🔌 未偵測到 USB OTG 列印裝置")
+                .setMessage("請確認：\n1. 平板已透過 OTG 轉接線連接出單機 / 貼紙機 USB 孔\n2. 印表機電源已開啟\n\n也可先設為「自動偵測印表機」，插上即可直接列印。")
+                .setPositiveButton("設為自動偵測", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface d, int w) {
+                        if (isReceipt) {
+                            PosPrintEngine.receiptUsbId = "AUTO";
+                            dbHelper.setSetting("receipt_usb_id", "AUTO");
+                        } else {
+                            PosPrintEngine.labelUsbId = "AUTO";
+                            dbHelper.setSetting("label_usb_id", "AUTO");
+                        }
+                        refreshPrinterStatusBadge();
+                        rebuildSettingsTab();
+                    }
+                })
+                .setNegativeButton("關閉", null)
+                .show();
+            return;
+        }
+        String[] items = new String[list.size() + 1];
+        items[0] = "🔄 自動偵測第一台 USB 印表機 (AUTO)";
+        for (int i = 0; i < list.size(); i++) {
+            items[i + 1] = list.get(i).label;
+        }
+        new AlertDialog.Builder(this)
+            .setTitle("🔌 選取 / 授權 USB OTG " + (isReceipt ? "出單機" : "貼紙機"))
+            .setItems(items, new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int which) {
+                    String vidPid = (which == 0) ? "AUTO" : list.get(which - 1).vidPid;
+                    if (isReceipt) {
+                        PosPrintEngine.receiptUsbId = vidPid;
+                        dbHelper.setSetting("receipt_usb_id", vidPid);
+                    } else {
+                        PosPrintEngine.labelUsbId = vidPid;
+                        dbHelper.setSetting("label_usb_id", vidPid);
+                    }
+                    PosPrintEngine.requestUsbPermissionAsync(MainActivity.this, vidPid,
+                        new PosPrintEngine.PrintCallback() {
+                            @Override public void onComplete(boolean ok, String msg) {
+                                refreshPrinterStatusBadge();
+                                rebuildSettingsTab();
+                                Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show();
+                            }
+                        });
+                }
+            })
+            .setNegativeButton("取消", null)
+            .show();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_BLUETOOTH_CONNECT) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                showBluetoothPrinterPickerDialog(pendingBtPickerForReceipt);
+            } else {
+                Toast.makeText(this, "⚠️ 未允許藍牙「鄰近裝置」權限，無法列舉或連線藍牙出單機", Toast.LENGTH_LONG).show();
+            }
+        }
     }
 
     private void authorizeAction(String actionTitle, boolean requireManagerRole, final Runnable onAuthorized) {
@@ -5589,22 +5813,26 @@ public class MainActivity extends Activity {
                             new AlertDialog.Builder(MainActivity.this)
                                 .setTitle("套用 IP：" + chosen.ip)
                                 .setMessage("請問要將此 IP 設為哪一台印表機？")
-                                .setPositiveButton("🧾 設為 HPRT 收據機", new DialogInterface.OnClickListener() {
+                                .setPositiveButton("🧾 設為收據出單機 (Wi-Fi)", new DialogInterface.OnClickListener() {
                                     @Override public void onClick(DialogInterface d2, int w2) {
                                         receiptIp = chosen.ip;
+                                        PosPrintEngine.receiptConnMode = PosPrintEngine.CONN_WIFI;
                                         dbHelper.setSetting("receipt_ip", receiptIp);
+                                        dbHelper.setSetting("receipt_conn_mode", PosPrintEngine.CONN_WIFI);
                                         refreshPrinterStatusBadge();
                                         rebuildSettingsTab();
-                                        Toast.makeText(MainActivity.this, "✅ 已更新收據機 IP 為 " + receiptIp, Toast.LENGTH_SHORT).show();
+                                        Toast.makeText(MainActivity.this, "✅ 已更新收據機 Wi-Fi IP 為 " + receiptIp, Toast.LENGTH_SHORT).show();
                                     }
                                 })
-                                .setNeutralButton("🏷️ 設為 GoDEX 貼紙機", new DialogInterface.OnClickListener() {
+                                .setNeutralButton("🏷️ 設為貼紙機 (Wi-Fi)", new DialogInterface.OnClickListener() {
                                     @Override public void onClick(DialogInterface d2, int w2) {
                                         labelIp = chosen.ip;
+                                        PosPrintEngine.labelConnMode = PosPrintEngine.CONN_WIFI;
                                         dbHelper.setSetting("label_ip", labelIp);
+                                        dbHelper.setSetting("label_conn_mode", PosPrintEngine.CONN_WIFI);
                                         refreshPrinterStatusBadge();
                                         rebuildSettingsTab();
-                                        Toast.makeText(MainActivity.this, "✅ 已更新貼紙機 IP 為 " + labelIp, Toast.LENGTH_SHORT).show();
+                                        Toast.makeText(MainActivity.this, "✅ 已更新貼紙機 Wi-Fi IP 為 " + labelIp, Toast.LENGTH_SHORT).show();
                                     }
                                 })
                                 .setNegativeButton("取消", null)
